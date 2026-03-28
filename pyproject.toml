@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sif-model"
+version = "0.1.0"
+description = "Spread model for SOXX/4 - IGV using a guide-driven baseline pipeline"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=2.0",
+    "pandas>=2.2",
+    "scikit-learn>=1.7",
+]
+
+[project.optional-dependencies]
+xgboost = ["xgboost>=2.1"]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
