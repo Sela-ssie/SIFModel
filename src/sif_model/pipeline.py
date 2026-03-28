@@ -33,6 +33,10 @@ class RunConfig:
     output_dir: Path = Path("outputs")
     use_xgboost: bool = False
     top_k_ensemble: int = 2
+    uncertainty_gate: float = 0.25
+    break_threshold_mult: float = 0.35
+    event_threshold_mult: float = 0.20
+    stability_penalty_weight: float = 0.60
 
 
 def load_stooq_close(symbol: str) -> pd.Series:
@@ -209,7 +213,15 @@ def model_factories(config: RunConfig) -> dict[str, Callable[[], Any]]:
     return factories
 
 
-def summarize_predictions(y_true: pd.Series, y_pred: pd.Series, context: pd.DataFrame, horizon: int) -> dict[str, float]:
+def summarize_predictions(
+    y_true: pd.Series,
+    y_pred: pd.Series,
+    context: pd.DataFrame,
+    horizon: int,
+    uncertainty_gate: float,
+    break_threshold_mult: float,
+    event_threshold_mult: float,
+) -> dict[str, float]:
     residual = y_true - y_pred
     residual_sigma = float(residual.std()) if len(residual) else 0.0
     edge_threshold = max(residual_sigma * 0.30, float(y_true.abs().median() * 0.15))
@@ -218,8 +230,15 @@ def summarize_predictions(y_true: pd.Series, y_pred: pd.Series, context: pd.Data
     size_multiplier = size_multiplier.where(context["macro_event_window"] == 0, 0.75)
     size_multiplier = size_multiplier.where(context["break_flag"] == 0, size_multiplier * 0.50)
 
+    adaptive_edge = edge_threshold * (
+        1.0
+        + break_threshold_mult * context["break_flag"].astype(float)
+        + event_threshold_mult * context["macro_event_window"].astype(float)
+    )
+
     direction = np.sign(y_pred)
-    trade_mask = y_pred.abs() > edge_threshold
+    normalized_confidence = y_pred.abs() / max(residual_sigma, 1e-8)
+    trade_mask = (y_pred.abs() > adaptive_edge) & (normalized_confidence > uncertainty_gate)
     weighted_signal = direction * size_multiplier * trade_mask.astype(float)
     realized_pnl = weighted_signal * y_true
     traded_pnl = realized_pnl[trade_mask]
@@ -241,6 +260,7 @@ def summarize_predictions(y_true: pd.Series, y_pred: pd.Series, context: pd.Data
         "cum_pnl_proxy": float(realized_pnl.sum()),
         "sharpe_proxy": sharpe_proxy,
         "selection_score": selection_score,
+        "raw_selection_score": selection_score,
         "residual_sigma": residual_sigma,
         "edge_threshold": edge_threshold,
     }
@@ -253,10 +273,15 @@ def walk_forward_backtest(
     context: pd.DataFrame,
     n_splits: int,
     horizon: int,
+    uncertainty_gate: float,
+    break_threshold_mult: float,
+    event_threshold_mult: float,
+    stability_penalty_weight: float,
 ) -> tuple[pd.Series, dict[str, float]]:
     effective_splits = max(2, min(n_splits, len(X) - 1))
     splitter = TimeSeriesSplit(n_splits=effective_splits)
     predictions = pd.Series(index=X.index, dtype=float)
+    fold_pnls: list[float] = []
 
     for train_idx, test_idx in splitter.split(X):
         model = model_builder()
@@ -264,13 +289,49 @@ def walk_forward_backtest(
         y_train = y.iloc[train_idx]
         X_test = X.iloc[test_idx]
         model.fit(X_train, y_train)
-        predictions.iloc[test_idx] = model.predict(X_test)
+        fold_pred = pd.Series(model.predict(X_test), index=X_test.index, dtype=float)
+        predictions.iloc[test_idx] = fold_pred
+        fold_metrics = summarize_predictions(
+            y.iloc[test_idx],
+            fold_pred,
+            context.iloc[test_idx],
+            horizon,
+            uncertainty_gate,
+            break_threshold_mult,
+            event_threshold_mult,
+        )
+        fold_pnls.append(float(fold_metrics["cum_pnl_proxy"]))
 
     valid_index = predictions.dropna().index
     valid_pred = predictions.loc[valid_index]
     valid_y = y.loc[valid_index]
     valid_context = context.loc[valid_index]
-    return predictions, summarize_predictions(valid_y, valid_pred, valid_context, horizon)
+    metrics = summarize_predictions(
+        valid_y,
+        valid_pred,
+        valid_context,
+        horizon,
+        uncertainty_gate,
+        break_threshold_mult,
+        event_threshold_mult,
+    )
+
+    mean_fold_pnl = float(np.mean(fold_pnls)) if fold_pnls else 0.0
+    worst_fold_pnl = float(np.min(fold_pnls)) if fold_pnls else 0.0
+    downside = abs(min(worst_fold_pnl, 0.0))
+    baseline = abs(mean_fold_pnl) + 1e-8
+    fold_drawdown_ratio = downside / baseline
+    stability_penalty = float(1.0 / (1.0 + stability_penalty_weight * fold_drawdown_ratio))
+
+    metrics["raw_selection_score"] = float(metrics["selection_score"])
+    metrics["selection_score"] = float(metrics["selection_score"] * stability_penalty)
+    metrics["stability_penalty"] = stability_penalty
+    metrics["worst_fold_pnl"] = worst_fold_pnl
+    metrics["mean_fold_pnl"] = mean_fold_pnl
+    metrics["fold_pnl_std"] = float(np.std(fold_pnls)) if fold_pnls else 0.0
+    metrics["positive_fold_rate"] = float(np.mean(np.asarray(fold_pnls) > 0.0)) if fold_pnls else 0.0
+
+    return predictions, metrics
 
 
 def summarize_feature_importance(model: Any, feature_names: list[str], top_n: int = 10) -> list[dict[str, Any]]:
@@ -335,7 +396,18 @@ def evaluate_models(config: RunConfig, dataset: pd.DataFrame) -> tuple[dict[str,
 
     evaluated: dict[str, Any] = {}
     for model_name, builder in model_factories(config).items():
-        predictions, metrics = walk_forward_backtest(builder, X, y, context, config.n_splits, config.horizon)
+        predictions, metrics = walk_forward_backtest(
+            builder,
+            X,
+            y,
+            context,
+            config.n_splits,
+            config.horizon,
+            config.uncertainty_gate,
+            config.break_threshold_mult,
+            config.event_threshold_mult,
+            config.stability_penalty_weight,
+        )
         fitted_model = builder()
         fitted_model.fit(X, y)
         final_prediction = float(fitted_model.predict(X.iloc[[-1]])[0])
@@ -362,21 +434,38 @@ def evaluate_models(config: RunConfig, dataset: pd.DataFrame) -> tuple[dict[str,
         [evaluated[name]["predictions"].rename(name) for name in ensemble_members],
         axis=1,
     )
-    ensemble_predictions = ensemble_prediction_frame.mean(axis=1)
+    member_scores = np.asarray(
+        [max(0.0, evaluated[name]["metrics"]["selection_score"]) for name in ensemble_members],
+        dtype=float,
+    )
+    if float(member_scores.sum()) <= 0.0:
+        member_weights = np.full(shape=len(ensemble_members), fill_value=1.0 / len(ensemble_members), dtype=float)
+    else:
+        member_weights = member_scores / member_scores.sum()
+    weighted_frame = ensemble_prediction_frame.mul(member_weights, axis=1)
+    ensemble_predictions = weighted_frame.sum(axis=1)
     ensemble_valid_index = ensemble_predictions.dropna().index
     ensemble_metrics = summarize_predictions(
         y.loc[ensemble_valid_index],
         ensemble_predictions.loc[ensemble_valid_index],
         context.loc[ensemble_valid_index],
         config.horizon,
+        config.uncertainty_gate,
+        config.break_threshold_mult,
+        config.event_threshold_mult,
     )
-    ensemble_final_prediction = float(np.mean([evaluated[name]["final_prediction"] for name in ensemble_members]))
+    ensemble_final_prediction = float(
+        np.dot(member_weights, np.asarray([evaluated[name]["final_prediction"] for name in ensemble_members], dtype=float))
+    )
 
     evaluated["ensemble_top"] = {
         "predictions": ensemble_predictions,
         "metrics": ensemble_metrics,
         "final_prediction": ensemble_final_prediction,
         "members": ensemble_members,
+        "member_weights": {
+            name: float(weight) for name, weight in zip(ensemble_members, member_weights, strict=False)
+        },
         "feature_importance": [],
     }
     prediction_table["ensemble_top_pred"] = ensemble_predictions
@@ -407,6 +496,8 @@ def run_pipeline(config: RunConfig) -> dict[str, Any]:
         }
         if "members" in payload:
             model_results[model_name]["members"] = payload["members"]
+        if "member_weights" in payload:
+            model_results[model_name]["member_weights"] = payload["member_weights"]
 
     leaderboard = [
         {
@@ -459,6 +550,30 @@ def parse_args() -> RunConfig:
     parser.add_argument("--output-dir", type=Path, default=Path("outputs"), help="Directory for JSON and CSV outputs.")
     parser.add_argument("--use-xgboost", action="store_true", help="Evaluate the optional XGBoost models.")
     parser.add_argument("--top-k-ensemble", type=int, default=2, help="Number of top models to average in the ensemble.")
+    parser.add_argument(
+        "--uncertainty-gate",
+        type=float,
+        default=0.25,
+        help="Minimum normalized confidence (|pred|/sigma) required to trade.",
+    )
+    parser.add_argument(
+        "--break-threshold-mult",
+        type=float,
+        default=0.35,
+        help="Additional threshold multiplier applied during break-like regimes.",
+    )
+    parser.add_argument(
+        "--event-threshold-mult",
+        type=float,
+        default=0.20,
+        help="Additional threshold multiplier applied during macro event windows.",
+    )
+    parser.add_argument(
+        "--stability-penalty-weight",
+        type=float,
+        default=0.60,
+        help="Penalty weight for unstable fold PnL when ranking models.",
+    )
     args = parser.parse_args()
     return RunConfig(
         horizon=args.horizon,
@@ -467,6 +582,10 @@ def parse_args() -> RunConfig:
         output_dir=args.output_dir,
         use_xgboost=args.use_xgboost,
         top_k_ensemble=args.top_k_ensemble,
+        uncertainty_gate=args.uncertainty_gate,
+        break_threshold_mult=args.break_threshold_mult,
+        event_threshold_mult=args.event_threshold_mult,
+        stability_penalty_weight=args.stability_penalty_weight,
     )
 
 
