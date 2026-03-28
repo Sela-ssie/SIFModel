@@ -35,8 +35,8 @@ class RunConfig:
     use_lightgbm: bool = False
     top_k_ensemble: int = 2
     uncertainty_gate: float = 0.25
-    break_threshold_mult: float = 0.35
-    event_threshold_mult: float = 0.20
+    break_threshold_mult: float = 0.25
+    event_threshold_mult: float = 0.10
     stability_penalty_weight: float = 0.60
     normalize_label: bool = False
     sign_error_penalty: float = 2.5
@@ -618,13 +618,13 @@ def parse_args() -> RunConfig:
     parser.add_argument(
         "--break-threshold-mult",
         type=float,
-        default=0.35,
+        default=0.25,
         help="Additional threshold multiplier applied during break-like regimes.",
     )
     parser.add_argument(
         "--event-threshold-mult",
         type=float,
-        default=0.20,
+        default=0.10,
         help="Additional threshold multiplier applied during macro event windows.",
     )
     parser.add_argument(
