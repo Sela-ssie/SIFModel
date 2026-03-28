@@ -48,13 +48,13 @@ python run_model.py --horizon 15
 Best current model-tournament mode:
 
 ```bash
-python run_model.py --horizon 15 --use-xgboost --use-lightgbm --top-k-ensemble 3
+python run_model.py --horizon 15 --use-xgboost --use-lightgbm --top-k-ensemble 4
 ```
 
 Installed-package equivalent:
 
 ```bash
-python -m sif_model --horizon 15 --use-xgboost --use-lightgbm --top-k-ensemble 3
+python -m sif_model --horizon 15 --use-xgboost --use-lightgbm --top-k-ensemble 4
 ```
 
 ## Outputs
@@ -87,4 +87,4 @@ The live section includes:
 
 ## Current Best Run
 
-Using `--use-xgboost --use-lightgbm --top-k-ensemble 3`, the latest validated run selected `lightgbm_shallow` as champion, with the weighted top-3 ensemble close behind and materially stronger than the earlier XGBoost-only configuration on selection score, Sharpe proxy, and cumulative PnL proxy.
+Using `--use-xgboost --use-lightgbm --top-k-ensemble 4`, the latest validated run selected `regime_router` as champion by switching between calm-regime and stress-regime specialists. That setup improved selection score, cumulative PnL proxy, and traded hit rate versus the prior single-model champion while keeping RMSE in a similar range.

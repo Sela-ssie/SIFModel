@@ -6,7 +6,7 @@
     "output_dir": "outputs",
     "use_xgboost": true,
     "use_lightgbm": true,
-    "top_k_ensemble": 3,
+    "top_k_ensemble": 4,
     "uncertainty_gate": 0.25,
     "break_threshold_mult": 0.25,
     "event_threshold_mult": 0.1,
@@ -14,15 +14,23 @@
     "normalize_label": false,
     "sign_error_penalty": 2.5,
     "use_direction_filter": false,
-    "direction_gate_prob": 0.54
+    "direction_gate_prob": 0.54,
+    "use_regime_router": true
   },
   "dataset": {
     "rows": 5169,
     "start": "2005-08-17",
     "end": "2026-03-06"
   },
-  "champion_model": "lightgbm_shallow",
+  "champion_model": "regime_router",
   "leaderboard": [
+    {
+      "model": "regime_router",
+      "selection_score": 0.27814685179023,
+      "cum_pnl_proxy": 563.024075,
+      "rmse": 2.8528389521804898,
+      "traded_hit_rate": 0.560856864654333
+    },
     {
       "model": "lightgbm_shallow",
       "selection_score": 0.2575139663781542,
@@ -39,10 +47,17 @@
     },
     {
       "model": "ensemble_top",
-      "selection_score": 0.23047209190414567,
-      "cum_pnl_proxy": 478.7100875,
-      "rmse": 2.634341383486792,
-      "traded_hit_rate": 0.553763440860215
+      "selection_score": 0.2198642761670027,
+      "cum_pnl_proxy": 470.434025,
+      "rmse": 2.638267838844571,
+      "traded_hit_rate": 0.5495403472931563
+    },
+    {
+      "model": "lightgbm_trend",
+      "selection_score": 0.1848980728714663,
+      "cum_pnl_proxy": 413.0146750000001,
+      "rmse": 2.9241252575209966,
+      "traded_hit_rate": 0.5430839002267573
     },
     {
       "model": "xgboost_regularized",
@@ -57,6 +72,13 @@
       "cum_pnl_proxy": 447.6487125,
       "rmse": 2.8348173818645916,
       "traded_hit_rate": 0.5383022774327122
+    },
+    {
+      "model": "lightgbm_highcap",
+      "selection_score": 0.14185758655974962,
+      "cum_pnl_proxy": 347.76487499999996,
+      "rmse": 2.9088545296038344,
+      "traded_hit_rate": 0.5497267759562842
     },
     {
       "model": "elastic_sparse",
@@ -620,45 +642,236 @@
         }
       ]
     },
-    "ensemble_top": {
+    "lightgbm_trend": {
       "metrics": {
-        "mae": 1.3097889196990473,
-        "rmse": 2.634341383486792,
-        "hit_rate": 0.4600502998645773,
-        "traded_hit_rate": 0.553763440860215,
-        "trade_rate": 0.1799187463726059,
-        "avg_daily_pnl_proxy": 0.0926117406655059,
-        "avg_traded_pnl_proxy": 0.5147420295698925,
-        "cum_pnl_proxy": 478.7100875,
-        "sharpe_proxy": 0.5433505807241604,
-        "selection_score": 0.23047209190414567,
-        "raw_selection_score": 0.23047209190414567,
-        "residual_sigma": 2.6252973633727743,
-        "edge_threshold": 0.7875892090118323
+        "mae": 1.5360208629299927,
+        "rmse": 2.9241252575209966,
+        "hit_rate": 0.537940379403794,
+        "traded_hit_rate": 0.5430839002267573,
+        "trade_rate": 0.1991869918699187,
+        "avg_daily_pnl_proxy": 0.09327341350496841,
+        "avg_traded_pnl_proxy": 0.46827060657596375,
+        "cum_pnl_proxy": 413.0146750000001,
+        "sharpe_proxy": 0.4899753963922701,
+        "selection_score": 0.1848980728714663,
+        "raw_selection_score": 0.2186778318995829,
+        "residual_sigma": 2.9054632371932403,
+        "edge_threshold": 0.8716389711579721,
+        "stability_penalty": 0.8455272821452323,
+        "worst_fold_pnl": -20.35079999999997,
+        "mean_fold_pnl": 66.83571125000003,
+        "fold_pnl_std": 67.03999026737627,
+        "positive_fold_rate": 0.8333333333333334
       },
       "live": {
         "spread_now": -7.109999999999999,
-        "predicted_delta_spread": 8.425213531848442,
-        "fair_value": 1.3152135318484426,
-        "bid": -0.33872380707640515,
-        "ask": 2.9691508707732903,
-        "residual_sigma": 2.6252973633727743,
-        "edge_threshold": 0.7875892090118323,
-        "signal_to_noise": 3.2092416079770842,
+        "predicted_delta_spread": 8.360474135064655,
+        "fair_value": 1.250474135064655,
+        "bid": -0.5799677043670863,
+        "ask": 3.0809159744963965,
+        "residual_sigma": 2.9054632371932403,
+        "edge_threshold": 0.8716389711579721,
+        "signal_to_noise": 2.8775012631517956,
+        "macro_event_window": false,
+        "break_alarm": true,
+        "recommended_size_multiplier": 0.5
+      },
+      "feature_importance": [
+        {
+          "feature": "S",
+          "importance": 410.0
+        },
+        {
+          "feature": "spread_range_60",
+          "importance": 360.0
+        },
+        {
+          "feature": "spread_vol_120",
+          "importance": 322.0
+        },
+        {
+          "feature": "spread_vol_60",
+          "importance": 267.0
+        },
+        {
+          "feature": "spread_vol_20",
+          "importance": 239.0
+        },
+        {
+          "feature": "DGS10",
+          "importance": 234.0
+        },
+        {
+          "feature": "beta_gap_qqq_60",
+          "importance": 226.0
+        },
+        {
+          "feature": "soxx_beta_qqq_60",
+          "importance": 222.0
+        },
+        {
+          "feature": "corr_120",
+          "importance": 204.0
+        },
+        {
+          "feature": "spread_range_20",
+          "importance": 191.0
+        }
+      ]
+    },
+    "lightgbm_highcap": {
+      "metrics": {
+        "mae": 1.5256808501419827,
+        "rmse": 2.9088545296038344,
+        "hit_rate": 0.5381662149954833,
+        "traded_hit_rate": 0.5497267759562842,
+        "trade_rate": 0.20663956639566394,
+        "avg_daily_pnl_proxy": 0.07853768631436313,
+        "avg_traded_pnl_proxy": 0.38007090163934415,
+        "cum_pnl_proxy": 347.76487499999996,
+        "sharpe_proxy": 0.40079012439743683,
+        "selection_score": 0.14185758655974962,
+        "raw_selection_score": 0.18218967149096402,
+        "residual_sigma": 2.9029581367584294,
+        "edge_threshold": 0.8708874410275288,
+        "stability_penalty": 0.7786258430505226,
+        "worst_fold_pnl": -25.126549999999963,
+        "mean_fold_pnl": 53.025650625000004,
+        "fold_pnl_std": 63.0446154139304,
+        "positive_fold_rate": 0.8333333333333334
+      },
+      "live": {
+        "spread_now": -7.109999999999999,
+        "predicted_delta_spread": 10.086820194444945,
+        "fair_value": 2.9768201944449455,
+        "bid": 1.147956568287135,
+        "ask": 4.805683820602756,
+        "residual_sigma": 2.9029581367584294,
+        "edge_threshold": 0.8708874410275288,
+        "signal_to_noise": 3.4746695333706503,
+        "macro_event_window": false,
+        "break_alarm": true,
+        "recommended_size_multiplier": 0.5
+      },
+      "feature_importance": [
+        {
+          "feature": "S",
+          "importance": 559.0
+        },
+        {
+          "feature": "spread_range_60",
+          "importance": 430.0
+        },
+        {
+          "feature": "spread_vol_60",
+          "importance": 308.0
+        },
+        {
+          "feature": "corr_120",
+          "importance": 304.0
+        },
+        {
+          "feature": "spread_vol_120",
+          "importance": 301.0
+        },
+        {
+          "feature": "beta_gap_qqq_60",
+          "importance": 294.0
+        },
+        {
+          "feature": "DGS10",
+          "importance": 293.0
+        },
+        {
+          "feature": "soxx_beta_qqq_60",
+          "importance": 291.0
+        },
+        {
+          "feature": "curve_slope",
+          "importance": 269.0
+        },
+        {
+          "feature": "DGS2",
+          "importance": 265.0
+        }
+      ]
+    },
+    "regime_router": {
+      "metrics": {
+        "mae": 1.4970810592790846,
+        "rmse": 2.8528389521804898,
+        "hit_rate": 0.5431345980126467,
+        "traded_hit_rate": 0.560856864654333,
+        "trade_rate": 0.23193315266485998,
+        "avg_daily_pnl_proxy": 0.1271508751129178,
+        "avg_traded_pnl_proxy": 0.5482220788704968,
+        "cum_pnl_proxy": 563.024075,
+        "sharpe_proxy": 0.5775541822187239,
+        "selection_score": 0.27814685179023,
+        "raw_selection_score": 0.27814685179023,
+        "residual_sigma": 2.8483627534832703,
+        "edge_threshold": 0.854508826044981
+      },
+      "live": {
+        "spread_now": -7.109999999999999,
+        "predicted_delta_spread": 8.164274289388251,
+        "fair_value": 1.0542742893882515,
+        "bid": -0.7401942453062087,
+        "ask": 2.848742824082712,
+        "residual_sigma": 2.8483627534832703,
+        "edge_threshold": 0.854508826044981,
+        "signal_to_noise": 2.866304258263502,
         "macro_event_window": false,
         "break_alarm": true,
         "recommended_size_multiplier": 0.5
       },
       "feature_importance": [],
       "members": [
+        "lightgbm_regularized",
+        "lightgbm_shallow"
+      ]
+    },
+    "ensemble_top": {
+      "metrics": {
+        "mae": 1.3083765600370882,
+        "rmse": 2.638267838844571,
+        "hit_rate": 0.4681756626039853,
+        "traded_hit_rate": 0.5495403472931563,
+        "trade_rate": 0.1893983362352486,
+        "avg_daily_pnl_proxy": 0.09101064519249372,
+        "avg_traded_pnl_proxy": 0.48052505107252313,
+        "cum_pnl_proxy": 470.434025,
+        "sharpe_proxy": 0.5052037790706368,
+        "selection_score": 0.2198642761670027,
+        "raw_selection_score": 0.2198642761670027,
+        "residual_sigma": 2.63115053379396,
+        "edge_threshold": 0.789345160138188
+      },
+      "live": {
+        "spread_now": -7.109999999999999,
+        "predicted_delta_spread": 8.295963805589503,
+        "fair_value": 1.1859638055895037,
+        "bid": -0.471661030700691,
+        "ask": 2.8435886418796983,
+        "residual_sigma": 2.63115053379396,
+        "edge_threshold": 0.789345160138188,
+        "signal_to_noise": 3.1529795422336497,
+        "macro_event_window": false,
+        "break_alarm": true,
+        "recommended_size_multiplier": 0.5
+      },
+      "feature_importance": [],
+      "members": [
+        "regime_router",
         "lightgbm_shallow",
         "lightgbm_regularized",
-        "xgboost_regularized"
+        "lightgbm_trend"
       ],
       "member_weights": {
-        "lightgbm_shallow": 0.3873596900844649,
-        "lightgbm_regularized": 0.36633568260397636,
-        "xgboost_regularized": 0.2463046273115587
+        "regime_router": 0.2885052739412578,
+        "lightgbm_shallow": 0.26710400256357975,
+        "lightgbm_regularized": 0.2526068912437606,
+        "lightgbm_trend": 0.19178383225140194
       }
     }
   }

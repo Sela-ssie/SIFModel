@@ -34,7 +34,7 @@ class RunConfig:
     output_dir: Path = Path("outputs")
     use_xgboost: bool = False
     use_lightgbm: bool = False
-    top_k_ensemble: int = 3
+    top_k_ensemble: int = 4
     uncertainty_gate: float = 0.25
     break_threshold_mult: float = 0.25
     event_threshold_mult: float = 0.10
@@ -43,6 +43,7 @@ class RunConfig:
     sign_error_penalty: float = 2.5
     use_direction_filter: bool = False
     direction_gate_prob: float = 0.54
+    use_regime_router: bool = True
 
 
 def load_stooq_close(symbol: str) -> pd.Series:
@@ -282,6 +283,28 @@ def model_factories(config: RunConfig) -> dict[str, Callable[[], Any]]:
                     reg_lambda=3.5,
                     min_child_samples=40,
                 ),
+                "lightgbm_trend": lambda: make_lightgbm(
+                    n_estimators=650,
+                    learning_rate=0.02,
+                    num_leaves=19,
+                    max_depth=4,
+                    subsample=0.9,
+                    colsample_bytree=0.85,
+                    reg_alpha=0.15,
+                    reg_lambda=2.0,
+                    min_child_samples=20,
+                ),
+                "lightgbm_highcap": lambda: make_lightgbm(
+                    n_estimators=500,
+                    learning_rate=0.03,
+                    num_leaves=31,
+                    max_depth=6,
+                    subsample=0.85,
+                    colsample_bytree=0.9,
+                    reg_alpha=0.1,
+                    reg_lambda=2.5,
+                    min_child_samples=16,
+                ),
             }
         )
     return factories
@@ -458,6 +481,108 @@ def summarize_feature_importance(model: Any, feature_names: list[str], top_n: in
     return [{"feature": str(name), "importance": float(value)} for name, value in importance.items()]
 
 
+def build_regime_router_candidate(
+    evaluated: dict[str, Any],
+    y: pd.Series,
+    context: pd.DataFrame,
+    config: RunConfig,
+    direction_prob_positive: pd.Series | None,
+) -> dict[str, Any] | None:
+    base_names = list(evaluated.keys())
+    if not base_names:
+        return None
+
+    calm_mask = (context["break_flag"] == 0) & (context["macro_event_window"] == 0)
+    stress_mask = ~calm_mask
+
+    def best_for_mask(mask: pd.Series) -> tuple[str, dict[str, float]] | None:
+        best_name: str | None = None
+        best_metrics: dict[str, float] | None = None
+        for name in base_names:
+            pred = evaluated[name]["predictions"].dropna()
+            if pred.empty:
+                continue
+            idx = pred.index[mask.reindex(pred.index).fillna(False)]
+            if len(idx) < 200:
+                continue
+            metrics = summarize_predictions(
+                y.loc[idx],
+                pred.loc[idx],
+                context.loc[idx],
+                config.horizon,
+                config.uncertainty_gate,
+                config.break_threshold_mult,
+                config.event_threshold_mult,
+                direction_prob_positive.loc[idx] if direction_prob_positive is not None else None,
+                config.direction_gate_prob,
+            )
+            if best_metrics is None or (
+                metrics["selection_score"],
+                metrics["cum_pnl_proxy"],
+                -metrics["rmse"],
+            ) > (
+                best_metrics["selection_score"],
+                best_metrics["cum_pnl_proxy"],
+                -best_metrics["rmse"],
+            ):
+                best_name = name
+                best_metrics = metrics
+
+        if best_name is None or best_metrics is None:
+            return None
+        return best_name, best_metrics
+
+    calm_choice = best_for_mask(calm_mask)
+    stress_choice = best_for_mask(stress_mask)
+    if calm_choice is None or stress_choice is None:
+        return None
+
+    calm_name, _ = calm_choice
+    stress_name, _ = stress_choice
+    calm_pred = evaluated[calm_name]["predictions"]
+    stress_pred = evaluated[stress_name]["predictions"]
+
+    router_pred = pd.Series(index=y.index, dtype=float)
+    calm_idx = router_pred.index[calm_mask.reindex(router_pred.index).fillna(False)]
+    stress_idx = router_pred.index[stress_mask.reindex(router_pred.index).fillna(False)]
+    router_pred.loc[calm_idx] = calm_pred.reindex(calm_idx)
+    router_pred.loc[stress_idx] = stress_pred.reindex(stress_idx)
+
+    valid_idx = router_pred.dropna().index
+    if len(valid_idx) < 400:
+        return None
+
+    metrics = summarize_predictions(
+        y.loc[valid_idx],
+        router_pred.loc[valid_idx],
+        context.loc[valid_idx],
+        config.horizon,
+        config.uncertainty_gate,
+        config.break_threshold_mult,
+        config.event_threshold_mult,
+        direction_prob_positive.loc[valid_idx] if direction_prob_positive is not None else None,
+        config.direction_gate_prob,
+    )
+
+    latest_is_stress = bool(stress_mask.iloc[-1])
+    final_prediction = float(
+        evaluated[stress_name]["final_prediction"] if latest_is_stress else evaluated[calm_name]["final_prediction"]
+    )
+
+    return {
+        "predictions": router_pred,
+        "metrics": metrics,
+        "final_prediction": final_prediction,
+        "feature_importance": [],
+        "members": [calm_name, stress_name],
+        "router_rules": {
+            "calm_model": calm_name,
+            "stress_model": stress_name,
+            "calm_condition": "break_flag==0 and macro_event_window==0",
+        },
+    }
+
+
 def build_quote_snapshot(
     config: RunConfig,
     latest_row: pd.Series,
@@ -542,6 +667,18 @@ def evaluate_models(config: RunConfig, dataset: pd.DataFrame) -> tuple[dict[str,
             "feature_importance": summarize_feature_importance(fitted_model, list(X.columns)),
         }
         prediction_table[f"{model_name}_pred"] = predictions
+
+    if config.use_regime_router:
+        router_payload = build_regime_router_candidate(
+            evaluated,
+            y,
+            context,
+            config,
+            direction_prob_positive,
+        )
+        if router_payload is not None:
+            evaluated["regime_router"] = router_payload
+            prediction_table["regime_router_pred"] = router_payload["predictions"]
 
     ranked_names = sorted(
         evaluated,
@@ -676,7 +813,7 @@ def parse_args() -> RunConfig:
     parser.add_argument("--output-dir", type=Path, default=Path("outputs"), help="Directory for JSON and CSV outputs.")
     parser.add_argument("--use-xgboost", action="store_true", help="Evaluate the optional XGBoost models.")
     parser.add_argument("--use-lightgbm", action="store_true", help="Evaluate optional LightGBM challenger models.")
-    parser.add_argument("--top-k-ensemble", type=int, default=3, help="Number of top models to average in the ensemble.")
+    parser.add_argument("--top-k-ensemble", type=int, default=4, help="Number of top models to average in the ensemble.")
     parser.add_argument(
         "--uncertainty-gate",
         type=float,
@@ -713,6 +850,11 @@ def parse_args() -> RunConfig:
         help="Enable experimental classifier-based direction confirmation before trading.",
     )
     parser.add_argument(
+        "--no-regime-router",
+        action="store_true",
+        help="Disable regime-router candidate that switches between calm/stress specialists.",
+    )
+    parser.add_argument(
         "--normalize-label",
         action="store_true",
         help="Enable volatility-normalized label training (off by default; harms linear models).",
@@ -740,6 +882,7 @@ def parse_args() -> RunConfig:
         sign_error_penalty=args.sign_error_penalty,
         use_direction_filter=args.use_direction_filter,
         direction_gate_prob=args.direction_gate_prob,
+        use_regime_router=not args.no_regime_router,
     )
 
 
