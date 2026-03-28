@@ -9,6 +9,7 @@ from typing import Any, Callable
 import numpy as np
 import pandas as pd
 from sklearn.linear_model import ElasticNet
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.pipeline import Pipeline
@@ -33,13 +34,15 @@ class RunConfig:
     output_dir: Path = Path("outputs")
     use_xgboost: bool = False
     use_lightgbm: bool = False
-    top_k_ensemble: int = 2
+    top_k_ensemble: int = 3
     uncertainty_gate: float = 0.25
     break_threshold_mult: float = 0.25
     event_threshold_mult: float = 0.10
     stability_penalty_weight: float = 0.60
     normalize_label: bool = False
     sign_error_penalty: float = 2.5
+    use_direction_filter: bool = False
+    direction_gate_prob: float = 0.54
 
 
 def load_stooq_close(symbol: str) -> pd.Series:
@@ -113,17 +116,20 @@ def build_feature_frame(config: RunConfig) -> pd.DataFrame:
 
     features = pd.DataFrame(index=prices.index)
     features["S"] = prices["S"]
-    for window in (1, 3, 5, 10, 20):
+    for window in (1, 3, 5, 10, 20, 40, 60):
         features[f"S_diff_{window}"] = prices["S"].diff(window)
-    for window in (10, 20, 60):
+    for window in (10, 20, 60, 120):
         features[f"S_z{window}"] = safe_zscore(prices["S"], window)
         features[f"spread_vol_{window}"] = prices["S"].diff().rolling(window).std()
 
     features["spread_vol_ratio_20_60"] = features["spread_vol_20"] / features["spread_vol_60"].replace(0.0, np.nan)
+    features["spread_vol_ratio_20_120"] = features["spread_vol_20"] / features["spread_vol_120"].replace(0.0, np.nan)
     features["spread_range_20"] = prices["S"].rolling(20).max() - prices["S"].rolling(20).min()
+    features["spread_range_60"] = prices["S"].rolling(60).max() - prices["S"].rolling(60).min()
     features["spread_trend_20"] = prices["S"].diff(20)
+    features["spread_trend_60"] = prices["S"].diff(60)
 
-    for window in (1, 5, 10, 20):
+    for window in (1, 5, 10, 20, 40, 60):
         features[f"SOXX_ret_{window}"] = pct_change(prices["SOXX.US"], window)
         features[f"IGV_ret_{window}"] = pct_change(prices["IGV.US"], window)
         features[f"QQQ_ret_{window}"] = pct_change(prices["QQQ.US"], window)
@@ -134,22 +140,32 @@ def build_feature_frame(config: RunConfig) -> pd.DataFrame:
 
     features["corr_20"] = returns["SOXX.US"].rolling(20).corr(returns["IGV.US"])
     features["corr_60"] = returns["SOXX.US"].rolling(60).corr(returns["IGV.US"])
+    features["corr_120"] = returns["SOXX.US"].rolling(120).corr(returns["IGV.US"])
     features["corr_gap_20_60"] = features["corr_20"] - features["corr_60"]
+    features["corr_gap_20_120"] = features["corr_20"] - features["corr_120"]
     features["soxx_beta_qqq_20"] = rolling_beta(returns["SOXX.US"], returns["QQQ.US"], 20)
     features["igv_beta_qqq_20"] = rolling_beta(returns["IGV.US"], returns["QQQ.US"], 20)
     features["beta_gap_qqq_20"] = features["soxx_beta_qqq_20"] - features["igv_beta_qqq_20"]
+    features["soxx_beta_qqq_60"] = rolling_beta(returns["SOXX.US"], returns["QQQ.US"], 60)
+    features["igv_beta_qqq_60"] = rolling_beta(returns["IGV.US"], returns["QQQ.US"], 60)
+    features["beta_gap_qqq_60"] = features["soxx_beta_qqq_60"] - features["igv_beta_qqq_60"]
 
     features["DGS10"] = prices["DGS10"]
     features["DGS2"] = prices["DGS2"]
     features["curve_slope"] = prices["DGS10"] - prices["DGS2"]
     features["curve_slope_chg_5"] = features["curve_slope"].diff(5)
+    features["curve_slope_chg_10"] = features["curve_slope"].diff(10)
     features["dgs10_chg_1"] = prices["DGS10"].diff(1)
     features["dgs10_chg_5"] = prices["DGS10"].diff(5)
+    features["dgs10_chg_10"] = prices["DGS10"].diff(10)
     features["dgs2_chg_1"] = prices["DGS2"].diff(1)
     features["dgs2_chg_5"] = prices["DGS2"].diff(5)
+    features["dgs2_chg_10"] = prices["DGS2"].diff(10)
     features["vix_level"] = prices["VIXCLS"]
     features["vix_chg_1"] = prices["VIXCLS"].diff(1)
+    features["vix_chg_5"] = prices["VIXCLS"].diff(5)
     features["vix_z20"] = safe_zscore(prices["VIXCLS"], 20)
+    features["vix_z60"] = safe_zscore(prices["VIXCLS"], 60)
 
     features = features.join(build_event_flags(features.index))
     features["break_flag"] = (
@@ -169,6 +185,15 @@ def make_elastic_net(alpha: float, l1_ratio: float) -> Pipeline:
         steps=[
             ("scaler", StandardScaler()),
             ("model", ElasticNet(alpha=alpha, l1_ratio=l1_ratio, max_iter=30000)),
+        ]
+    )
+
+
+def make_direction_classifier() -> Pipeline:
+    return Pipeline(
+        steps=[
+            ("scaler", StandardScaler()),
+            ("model", LogisticRegression(max_iter=5000, class_weight="balanced")),
         ]
     )
 
@@ -270,6 +295,8 @@ def summarize_predictions(
     uncertainty_gate: float,
     break_threshold_mult: float,
     event_threshold_mult: float,
+    direction_prob_positive: pd.Series | None = None,
+    direction_gate_prob: float = 0.50,
 ) -> dict[str, float]:
     residual = y_true - y_pred
     residual_sigma = float(residual.std()) if len(residual) else 0.0
@@ -288,6 +315,12 @@ def summarize_predictions(
     direction = np.sign(y_pred)
     normalized_confidence = y_pred.abs() / max(residual_sigma, 1e-8)
     trade_mask = (y_pred.abs() > adaptive_edge) & (normalized_confidence > uncertainty_gate)
+    if direction_prob_positive is not None:
+        direction_prob_positive = direction_prob_positive.reindex(y_pred.index)
+        classifier_direction = np.where(direction_prob_positive >= 0.5, 1.0, -1.0)
+        classifier_confidence = np.maximum(direction_prob_positive, 1.0 - direction_prob_positive)
+        agreement = classifier_direction == np.where(direction >= 0.0, 1.0, -1.0)
+        trade_mask = trade_mask & agreement & (classifier_confidence >= direction_gate_prob)
     weighted_signal = direction * size_multiplier * trade_mask.astype(float)
     realized_pnl = weighted_signal * y_true
     traded_pnl = realized_pnl[trade_mask]
@@ -315,6 +348,26 @@ def summarize_predictions(
     }
 
 
+def walk_forward_direction_filter(
+    X: pd.DataFrame,
+    y: pd.Series,
+    n_splits: int,
+) -> tuple[pd.Series, Pipeline]:
+    effective_splits = max(2, min(n_splits, len(X) - 1))
+    splitter = TimeSeriesSplit(n_splits=effective_splits)
+    direction_prob = pd.Series(index=X.index, dtype=float)
+
+    for train_idx, test_idx in splitter.split(X):
+        classifier = make_direction_classifier()
+        y_train_direction = (y.iloc[train_idx] > 0.0).astype(int)
+        classifier.fit(X.iloc[train_idx], y_train_direction)
+        direction_prob.iloc[test_idx] = classifier.predict_proba(X.iloc[test_idx])[:, 1]
+
+    full_classifier = make_direction_classifier()
+    full_classifier.fit(X, (y > 0.0).astype(int))
+    return direction_prob, full_classifier
+
+
 def walk_forward_backtest(
     model_builder: Callable[[], Any],
     X: pd.DataFrame,
@@ -327,6 +380,8 @@ def walk_forward_backtest(
     event_threshold_mult: float,
     stability_penalty_weight: float,
     vol_scale: pd.Series | None = None,
+    direction_prob_positive: pd.Series | None = None,
+    direction_gate_prob: float = 0.50,
 ) -> tuple[pd.Series, dict[str, float]]:
     effective_splits = max(2, min(n_splits, len(X) - 1))
     splitter = TimeSeriesSplit(n_splits=effective_splits)
@@ -351,6 +406,8 @@ def walk_forward_backtest(
             uncertainty_gate,
             break_threshold_mult,
             event_threshold_mult,
+            direction_prob_positive.iloc[test_idx] if direction_prob_positive is not None else None,
+            direction_gate_prob,
         )
         fold_pnls.append(float(fold_metrics["cum_pnl_proxy"]))
 
@@ -366,6 +423,8 @@ def walk_forward_backtest(
         uncertainty_gate,
         break_threshold_mult,
         event_threshold_mult,
+        direction_prob_positive.loc[valid_index] if direction_prob_positive is not None else None,
+        direction_gate_prob,
     )
 
     mean_fold_pnl = float(np.mean(fold_pnls)) if fold_pnls else 0.0
@@ -443,9 +502,14 @@ def evaluate_models(config: RunConfig, dataset: pd.DataFrame) -> tuple[dict[str,
     y = dataset["dS_H"]
     vol_scale: pd.Series | None = dataset["spread_vol_20"].clip(lower=1e-8) if config.normalize_label else None
     context = dataset[["macro_event_window", "break_flag", "S_now"]].copy()
+    direction_prob_positive: pd.Series | None = None
+    if config.use_direction_filter:
+        direction_prob_positive, _ = walk_forward_direction_filter(X, y, config.n_splits)
 
     prediction_table = pd.DataFrame(index=dataset.index)
     prediction_table["actual_dS_H"] = y
+    if direction_prob_positive is not None:
+        prediction_table["direction_prob_positive"] = direction_prob_positive
 
     evaluated: dict[str, Any] = {}
     for model_name, builder in model_factories(config).items():
@@ -461,6 +525,8 @@ def evaluate_models(config: RunConfig, dataset: pd.DataFrame) -> tuple[dict[str,
             config.event_threshold_mult,
             config.stability_penalty_weight,
             vol_scale=vol_scale,
+            direction_prob_positive=direction_prob_positive,
+            direction_gate_prob=config.direction_gate_prob,
         )
         fitted_model = builder()
         if vol_scale is not None:
@@ -511,6 +577,8 @@ def evaluate_models(config: RunConfig, dataset: pd.DataFrame) -> tuple[dict[str,
         config.uncertainty_gate,
         config.break_threshold_mult,
         config.event_threshold_mult,
+        direction_prob_positive.loc[ensemble_valid_index] if direction_prob_positive is not None else None,
+        config.direction_gate_prob,
     )
     ensemble_final_prediction = float(
         np.dot(member_weights, np.asarray([evaluated[name]["final_prediction"] for name in ensemble_members], dtype=float))
@@ -608,7 +676,7 @@ def parse_args() -> RunConfig:
     parser.add_argument("--output-dir", type=Path, default=Path("outputs"), help="Directory for JSON and CSV outputs.")
     parser.add_argument("--use-xgboost", action="store_true", help="Evaluate the optional XGBoost models.")
     parser.add_argument("--use-lightgbm", action="store_true", help="Evaluate optional LightGBM challenger models.")
-    parser.add_argument("--top-k-ensemble", type=int, default=2, help="Number of top models to average in the ensemble.")
+    parser.add_argument("--top-k-ensemble", type=int, default=3, help="Number of top models to average in the ensemble.")
     parser.add_argument(
         "--uncertainty-gate",
         type=float,
@@ -632,6 +700,17 @@ def parse_args() -> RunConfig:
         type=float,
         default=0.60,
         help="Penalty weight for unstable fold PnL when ranking models.",
+    )
+    parser.add_argument(
+        "--direction-gate-prob",
+        type=float,
+        default=0.54,
+        help="Minimum classifier confidence required when confirming signal direction.",
+    )
+    parser.add_argument(
+        "--use-direction-filter",
+        action="store_true",
+        help="Enable experimental classifier-based direction confirmation before trading.",
     )
     parser.add_argument(
         "--normalize-label",
@@ -659,6 +738,8 @@ def parse_args() -> RunConfig:
         stability_penalty_weight=args.stability_penalty_weight,
         normalize_label=args.normalize_label,
         sign_error_penalty=args.sign_error_penalty,
+        use_direction_filter=args.use_direction_filter,
+        direction_gate_prob=args.direction_gate_prob,
     )
 
 

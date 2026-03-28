@@ -34,7 +34,7 @@ pip install -e .
 Recommended stronger setup:
 
 ```bash
-pip install -e .[xgboost]
+pip install -e .[full]
 ```
 
 ## Run
@@ -45,16 +45,16 @@ Baseline linear-only mode:
 python run_model.py --horizon 15
 ```
 
-Stronger model-tournament mode:
+Best current model-tournament mode:
 
 ```bash
-python run_model.py --horizon 15 --use-xgboost --top-k-ensemble 2
+python run_model.py --horizon 15 --use-xgboost --use-lightgbm --top-k-ensemble 3
 ```
 
 Installed-package equivalent:
 
 ```bash
-python -m sif_model --horizon 15 --use-xgboost
+python -m sif_model --horizon 15 --use-xgboost --use-lightgbm --top-k-ensemble 3
 ```
 
 ## Outputs
@@ -87,5 +87,4 @@ The live section includes:
 
 ## Current Best Run
 
-Using `--use-xgboost --top-k-ensemble 2`, the latest validated run selected `xgboost_regularized` as champion over the ElasticNet variants and the top-2 ensemble. That setup materially improved the simple out-of-sample PnL proxy versus the original baseline-only pipeline.
-# SIFModel
+Using `--use-xgboost --use-lightgbm --top-k-ensemble 3`, the latest validated run selected `lightgbm_shallow` as champion, with the weighted top-3 ensemble close behind and materially stronger than the earlier XGBoost-only configuration on selection score, Sharpe proxy, and cumulative PnL proxy.
