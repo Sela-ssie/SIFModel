@@ -37,6 +37,8 @@ class RunConfig:
     break_threshold_mult: float = 0.35
     event_threshold_mult: float = 0.20
     stability_penalty_weight: float = 0.60
+    normalize_label: bool = False
+    sign_error_penalty: float = 2.5
 
 
 def load_stooq_close(symbol: str) -> pd.Series:
@@ -170,12 +172,21 @@ def make_elastic_net(alpha: float, l1_ratio: float) -> Pipeline:
     )
 
 
-def make_xgboost(**kwargs: Any) -> Any:
+def make_xgboost(sign_error_penalty: float = 1.0, **kwargs: Any) -> Any:
     try:
         from xgboost import XGBRegressor
     except ImportError as exc:
         raise RuntimeError("XGBoost is not installed. Run: pip install -e .[xgboost]") from exc
-    return XGBRegressor(objective="reg:squarederror", random_state=7, **kwargs)
+    if sign_error_penalty > 1.0:
+        def _objective(labels: np.ndarray, preds: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+            residual = preds - labels
+            wrong = (np.sign(preds) != np.sign(labels)).astype(float)
+            mult = 1.0 + (sign_error_penalty - 1.0) * wrong
+            return residual * mult, mult
+        objective: Any = _objective
+    else:
+        objective = "reg:squarederror"
+    return XGBRegressor(objective=objective, random_state=7, **kwargs)
 
 
 def model_factories(config: RunConfig) -> dict[str, Callable[[], Any]]:
@@ -188,6 +199,7 @@ def model_factories(config: RunConfig) -> dict[str, Callable[[], Any]]:
         factories.update(
             {
                 "xgboost_shallow": lambda: make_xgboost(
+                    sign_error_penalty=config.sign_error_penalty,
                     n_estimators=250,
                     max_depth=2,
                     learning_rate=0.04,
@@ -198,6 +210,7 @@ def model_factories(config: RunConfig) -> dict[str, Callable[[], Any]]:
                     min_child_weight=4,
                 ),
                 "xgboost_regularized": lambda: make_xgboost(
+                    sign_error_penalty=config.sign_error_penalty,
                     n_estimators=400,
                     max_depth=3,
                     learning_rate=0.03,
@@ -277,6 +290,7 @@ def walk_forward_backtest(
     break_threshold_mult: float,
     event_threshold_mult: float,
     stability_penalty_weight: float,
+    vol_scale: pd.Series | None = None,
 ) -> tuple[pd.Series, dict[str, float]]:
     effective_splits = max(2, min(n_splits, len(X) - 1))
     splitter = TimeSeriesSplit(n_splits=effective_splits)
@@ -286,10 +300,12 @@ def walk_forward_backtest(
     for train_idx, test_idx in splitter.split(X):
         model = model_builder()
         X_train = X.iloc[train_idx]
-        y_train = y.iloc[train_idx]
+        y_train_raw = y.iloc[train_idx]
+        y_train_fit = y_train_raw / vol_scale.iloc[train_idx] if vol_scale is not None else y_train_raw
         X_test = X.iloc[test_idx]
-        model.fit(X_train, y_train)
-        fold_pred = pd.Series(model.predict(X_test), index=X_test.index, dtype=float)
+        model.fit(X_train, y_train_fit)
+        fold_pred_norm = pd.Series(model.predict(X_test), index=X_test.index, dtype=float)
+        fold_pred = fold_pred_norm * vol_scale.iloc[test_idx] if vol_scale is not None else fold_pred_norm
         predictions.iloc[test_idx] = fold_pred
         fold_metrics = summarize_predictions(
             y.iloc[test_idx],
@@ -389,6 +405,7 @@ def build_quote_snapshot(
 def evaluate_models(config: RunConfig, dataset: pd.DataFrame) -> tuple[dict[str, Any], pd.DataFrame]:
     X = dataset.drop(columns=["dS_H", "S_now"])
     y = dataset["dS_H"]
+    vol_scale: pd.Series | None = dataset["spread_vol_20"].clip(lower=1e-8) if config.normalize_label else None
     context = dataset[["macro_event_window", "break_flag", "S_now"]].copy()
 
     prediction_table = pd.DataFrame(index=dataset.index)
@@ -407,10 +424,15 @@ def evaluate_models(config: RunConfig, dataset: pd.DataFrame) -> tuple[dict[str,
             config.break_threshold_mult,
             config.event_threshold_mult,
             config.stability_penalty_weight,
+            vol_scale=vol_scale,
         )
         fitted_model = builder()
-        fitted_model.fit(X, y)
-        final_prediction = float(fitted_model.predict(X.iloc[[-1]])[0])
+        if vol_scale is not None:
+            fitted_model.fit(X, y / vol_scale)
+            final_prediction = float(fitted_model.predict(X.iloc[[-1]])[0]) * float(vol_scale.iloc[-1])
+        else:
+            fitted_model.fit(X, y)
+            final_prediction = float(fitted_model.predict(X.iloc[[-1]])[0])
         evaluated[model_name] = {
             "predictions": predictions,
             "metrics": metrics,
@@ -574,6 +596,17 @@ def parse_args() -> RunConfig:
         default=0.60,
         help="Penalty weight for unstable fold PnL when ranking models.",
     )
+    parser.add_argument(
+        "--normalize-label",
+        action="store_true",
+        help="Enable volatility-normalized label training (off by default; harms linear models).",
+    )
+    parser.add_argument(
+        "--sign-error-penalty",
+        type=float,
+        default=2.5,
+        help="XGBoost sign-error loss multiplier (>1 penalises wrong-direction predictions).",
+    )
     args = parser.parse_args()
     return RunConfig(
         horizon=args.horizon,
@@ -586,6 +619,8 @@ def parse_args() -> RunConfig:
         break_threshold_mult=args.break_threshold_mult,
         event_threshold_mult=args.event_threshold_mult,
         stability_penalty_weight=args.stability_penalty_weight,
+        normalize_label=args.normalize_label,
+        sign_error_penalty=args.sign_error_penalty,
     )
 
 
