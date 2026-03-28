@@ -32,6 +32,7 @@ class RunConfig:
     quote_width: float = 0.35
     output_dir: Path = Path("outputs")
     use_xgboost: bool = False
+    use_lightgbm: bool = False
     top_k_ensemble: int = 2
     uncertainty_gate: float = 0.25
     break_threshold_mult: float = 0.35
@@ -189,6 +190,14 @@ def make_xgboost(sign_error_penalty: float = 1.0, **kwargs: Any) -> Any:
     return XGBRegressor(objective=objective, random_state=7, **kwargs)
 
 
+def make_lightgbm(**kwargs: Any) -> Any:
+    try:
+        from lightgbm import LGBMRegressor
+    except ImportError as exc:
+        raise RuntimeError("LightGBM is not installed. Run: pip install lightgbm") from exc
+    return LGBMRegressor(objective="regression", random_state=7, verbose=-1, **kwargs)
+
+
 def model_factories(config: RunConfig) -> dict[str, Callable[[], Any]]:
     factories: dict[str, Callable[[], Any]] = {
         "elastic_stable": lambda: make_elastic_net(alpha=0.08, l1_ratio=0.25),
@@ -220,6 +229,33 @@ def model_factories(config: RunConfig) -> dict[str, Callable[[], Any]]:
                     reg_lambda=3.0,
                     min_child_weight=5,
                     gamma=0.1,
+                ),
+            }
+        )
+    if config.use_lightgbm:
+        factories.update(
+            {
+                "lightgbm_shallow": lambda: make_lightgbm(
+                    n_estimators=300,
+                    learning_rate=0.04,
+                    num_leaves=15,
+                    max_depth=4,
+                    subsample=0.8,
+                    colsample_bytree=0.8,
+                    reg_alpha=0.2,
+                    reg_lambda=2.5,
+                    min_child_samples=30,
+                ),
+                "lightgbm_regularized": lambda: make_lightgbm(
+                    n_estimators=450,
+                    learning_rate=0.03,
+                    num_leaves=23,
+                    max_depth=5,
+                    subsample=0.85,
+                    colsample_bytree=0.85,
+                    reg_alpha=0.4,
+                    reg_lambda=3.5,
+                    min_child_samples=40,
                 ),
             }
         )
@@ -571,6 +607,7 @@ def parse_args() -> RunConfig:
     parser.add_argument("--quote-width", type=float, default=0.35, help="Base quote-width factor applied to residual sigma.")
     parser.add_argument("--output-dir", type=Path, default=Path("outputs"), help="Directory for JSON and CSV outputs.")
     parser.add_argument("--use-xgboost", action="store_true", help="Evaluate the optional XGBoost models.")
+    parser.add_argument("--use-lightgbm", action="store_true", help="Evaluate optional LightGBM challenger models.")
     parser.add_argument("--top-k-ensemble", type=int, default=2, help="Number of top models to average in the ensemble.")
     parser.add_argument(
         "--uncertainty-gate",
@@ -614,6 +651,7 @@ def parse_args() -> RunConfig:
         quote_width=args.quote_width,
         output_dir=args.output_dir,
         use_xgboost=args.use_xgboost,
+        use_lightgbm=args.use_lightgbm,
         top_k_ensemble=args.top_k_ensemble,
         uncertainty_gate=args.uncertainty_gate,
         break_threshold_mult=args.break_threshold_mult,
