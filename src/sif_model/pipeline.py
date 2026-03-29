@@ -1,8 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
+import random
+import time
+import urllib.request
+import urllib.parse
 from dataclasses import asdict, dataclass
+from itertools import product
 from pathlib import Path
 from typing import Any, Callable
 
@@ -23,6 +29,12 @@ EVENT_SCHEDULE = {
 }
 
 STOOQ_SYMBOLS = ("soxx.us", "igv.us", "qqq.us", "spy.us")
+YAHOO_SYMBOL_MAP = {
+    "soxx.us": "SOXX",
+    "igv.us": "IGV",
+    "qqq.us": "QQQ",
+    "spy.us": "SPY",
+}
 FRED_SERIES = ("DGS10", "DGS2", "VIXCLS")
 
 
@@ -44,16 +56,77 @@ class RunConfig:
     use_direction_filter: bool = False
     direction_gate_prob: float = 0.54
     use_regime_router: bool = True
+    min_size_multiplier: float = 1.0
+    max_size_multiplier: float = 1.0
+    size_sigmoid_k: float = 3.0
+    size_conf_mid: float = 0.60
+    use_purged_cv: bool = True
+    holdout_fraction: float = 0.15
+    use_meta_label_filter: bool = False
+    meta_label_gate_prob: float = 0.56
+    run_objective_tuning: bool = False
+    tuning_trials: int = 24
+
+
+def clone_config(config: RunConfig, **updates: Any) -> RunConfig:
+    cfg = asdict(config)
+    cfg.update(updates)
+    output_dir_value = cfg.get("output_dir", Path("outputs"))
+    cfg["output_dir"] = output_dir_value if isinstance(output_dir_value, Path) else Path(str(output_dir_value))
+    return RunConfig(**cfg)
 
 
 def load_stooq_close(symbol: str) -> pd.Series:
     url = f"https://stooq.com/q/d/l/?s={symbol}&i=d"
-    frame = pd.read_csv(url)
+    last_error: Exception | None = None
+    frame: pd.DataFrame | None = None
+    for attempt in range(4):
+        try:
+            request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(request, timeout=15) as response:
+                payload = response.read().decode("utf-8", errors="ignore")
+            if not payload.strip():
+                raise ValueError(f"Empty response for {symbol}")
+            frame = pd.read_csv(io.StringIO(payload))
+            if len(frame.columns) == 0:
+                raise ValueError(f"No columns returned for {symbol}")
+            break
+        except Exception as exc:
+            last_error = exc
+            if attempt < 3:
+                time.sleep(1.0 + attempt)
+    if frame is None:
+        yahoo_symbol = YAHOO_SYMBOL_MAP.get(symbol.lower())
+        if yahoo_symbol is not None:
+            return load_yahoo_close(yahoo_symbol).rename(symbol.upper())
+        raise ValueError(f"Failed to fetch Stooq data for {symbol}: {last_error}")
     if "Date" not in frame.columns or "Close" not in frame.columns:
         raise ValueError(f"Unexpected Stooq schema for {symbol}: {frame.columns.tolist()}")
     frame["Date"] = pd.to_datetime(frame["Date"])
     frame = frame.sort_values("Date").set_index("Date")
     return frame["Close"].astype(float).rename(symbol.upper())
+
+
+def load_yahoo_close(symbol: str) -> pd.Series:
+    period1 = int(pd.Timestamp("2010-01-01").timestamp())
+    period2 = int(pd.Timestamp.utcnow().timestamp())
+    params = urllib.parse.urlencode({"period1": period1, "period2": period2, "interval": "1d"})
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?{params}"
+    request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(request, timeout=20) as response:
+        payload = response.read().decode("utf-8", errors="ignore")
+    body = json.loads(payload)
+    result = body.get("chart", {}).get("result", [])
+    if not result:
+        raise ValueError(f"Unexpected Yahoo response for {symbol}: {body}")
+    timestamps = result[0].get("timestamp", [])
+    closes = result[0].get("indicators", {}).get("quote", [{}])[0].get("close", [])
+    if not timestamps or not closes:
+        raise ValueError(f"Yahoo chart response missing data for {symbol}")
+    index = pd.to_datetime(pd.Series(timestamps), unit="s", utc=True).dt.tz_convert(None).dt.normalize()
+    close_series = pd.to_numeric(pd.Series(closes), errors="coerce")
+    frame = pd.DataFrame({"close": close_series.values}, index=index)
+    return frame["close"].dropna().astype(float).rename(symbol)
 
 
 def load_fred_series(series_id: str) -> pd.Series:
@@ -320,6 +393,12 @@ def summarize_predictions(
     event_threshold_mult: float,
     direction_prob_positive: pd.Series | None = None,
     direction_gate_prob: float = 0.50,
+    meta_label_prob: pd.Series | None = None,
+    meta_label_gate_prob: float = 0.56,
+    min_size_multiplier: float = 0.35,
+    max_size_multiplier: float = 1.25,
+    size_sigmoid_k: float = 3.0,
+    size_conf_mid: float = 0.60,
 ) -> dict[str, float]:
     residual = y_true - y_pred
     residual_sigma = float(residual.std()) if len(residual) else 0.0
@@ -344,7 +423,15 @@ def summarize_predictions(
         classifier_confidence = np.maximum(direction_prob_positive, 1.0 - direction_prob_positive)
         agreement = classifier_direction == np.where(direction >= 0.0, 1.0, -1.0)
         trade_mask = trade_mask & agreement & (classifier_confidence >= direction_gate_prob)
-    weighted_signal = direction * size_multiplier * trade_mask.astype(float)
+    if meta_label_prob is not None:
+        trade_mask = trade_mask & (meta_label_prob.reindex(y_pred.index).fillna(0.0) >= meta_label_gate_prob)
+
+    edge_excess = (y_pred.abs() - adaptive_edge) / max(residual_sigma, 1e-8)
+    confidence_curve = 1.0 / (1.0 + np.exp(-size_sigmoid_k * (edge_excess - size_conf_mid)))
+    dynamic_size = min_size_multiplier + (max_size_multiplier - min_size_multiplier) * confidence_curve
+    effective_size_multiplier = size_multiplier * dynamic_size
+
+    weighted_signal = direction * effective_size_multiplier * trade_mask.astype(float)
     realized_pnl = weighted_signal * y_true
     traded_pnl = realized_pnl[trade_mask]
 
@@ -363,6 +450,8 @@ def summarize_predictions(
         "avg_daily_pnl_proxy": float(realized_pnl.mean()),
         "avg_traded_pnl_proxy": float(traded_pnl.mean()) if len(traded_pnl) else 0.0,
         "cum_pnl_proxy": float(realized_pnl.sum()),
+        "avg_size_multiplier": float(effective_size_multiplier.where(trade_mask, 0.0).mean()),
+        "avg_traded_size_multiplier": float(effective_size_multiplier[trade_mask].mean()) if trade_mask.any() else 0.0,
         "sharpe_proxy": sharpe_proxy,
         "selection_score": selection_score,
         "raw_selection_score": selection_score,
@@ -391,6 +480,74 @@ def walk_forward_direction_filter(
     return direction_prob, full_classifier
 
 
+def fold_meta_label_probability(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    base_model: Any,
+    X_test: pd.DataFrame,
+) -> pd.Series:
+    """Estimate fold-local trade-quality probability for a base model signal."""
+    train_pred = pd.Series(base_model.predict(X_train), index=X_train.index, dtype=float)
+    train_edge = float(max(1e-8, y_train.abs().median() * 0.10))
+    quality_label = ((np.sign(train_pred) == np.sign(y_train)) & (train_pred.abs() >= train_edge)).astype(int)
+
+    if quality_label.nunique() < 2:
+        default_prob = float(quality_label.iloc[-1]) if len(quality_label) else 0.5
+        return pd.Series(default_prob, index=X_test.index, dtype=float)
+
+    quality_clf = make_direction_classifier()
+    quality_clf.fit(X_train, quality_label)
+    return pd.Series(quality_clf.predict_proba(X_test)[:, 1], index=X_test.index, dtype=float)
+
+
+def purged_walk_forward_split(
+    X: pd.DataFrame,
+    n_splits: int,
+    horizon: int,
+    holdout_fraction: float = 0.15,
+    holdout_size: int | None = None,
+) -> tuple[list[tuple[np.ndarray, np.ndarray]], np.ndarray]:
+    """
+    Create purged walk-forward splits with lookahead bias removal and a locked holdout block.
+    
+    For each fold, remove training data within `horizon` periods before the test set starts
+    to prevent lookahead bias.
+    
+    Returns:
+        - list of (train_idx, test_idx) tuples for CV folds
+        - holdout_idx for final locked holdout evaluation
+    """
+    n_total = len(X)
+    if holdout_size is None:
+        holdout_size = max(1, int(n_total * holdout_fraction))
+    else:
+        holdout_size = max(1, int(holdout_size))
+    holdout_size = min(holdout_size, max(1, n_total - 3))
+    holdout_start = n_total - holdout_size
+    holdout_idx = np.arange(holdout_start, n_total)
+    
+    # Create time series splits on the non-holdout portion
+    cv_X = X.iloc[:holdout_start]
+    n_cv = len(cv_X)
+    effective_splits = max(2, min(n_splits, n_cv - 1))
+    splitter = TimeSeriesSplit(n_splits=effective_splits)
+    
+    purged_splits = []
+    for train_idx_relative, test_idx_relative in splitter.split(cv_X):
+        # Purge by sample index gap (trading periods), not calendar days.
+        test_start_pos = int(test_idx_relative[0])
+        purge_until = max(0, test_start_pos - max(1, horizon))
+        purged_train_idx = train_idx_relative[train_idx_relative < purge_until]
+        if len(purged_train_idx) > 10:
+            purged_splits.append((purged_train_idx, test_idx_relative))
+
+    if not purged_splits:
+        fallback_splitter = TimeSeriesSplit(n_splits=max(2, min(n_splits, max(3, n_cv - 1))))
+        purged_splits = list(fallback_splitter.split(cv_X))
+    
+    return purged_splits, holdout_idx
+
+
 def walk_forward_backtest(
     model_builder: Callable[[], Any],
     X: pd.DataFrame,
@@ -405,13 +562,39 @@ def walk_forward_backtest(
     vol_scale: pd.Series | None = None,
     direction_prob_positive: pd.Series | None = None,
     direction_gate_prob: float = 0.50,
-) -> tuple[pd.Series, dict[str, float]]:
-    effective_splits = max(2, min(n_splits, len(X) - 1))
-    splitter = TimeSeriesSplit(n_splits=effective_splits)
-    predictions = pd.Series(index=X.index, dtype=float)
-    fold_pnls: list[float] = []
+    use_meta_label_filter: bool = False,
+    meta_label_gate_prob: float = 0.56,
+    min_size_multiplier: float = 0.35,
+    max_size_multiplier: float = 1.25,
+    size_sigmoid_k: float = 3.0,
+    size_conf_mid: float = 0.60,
+    use_purged_cv: bool = True,
+    holdout_fraction: float = 0.15,
+    holdout_size: int | None = None,
+) -> tuple[pd.Series, dict[str, float], dict[str, Any]]:
+    """
+    Walk-forward backtest with optional purged CV and locked holdout evaluation.
 
-    for train_idx, test_idx in splitter.split(X):
+    Returns:
+        predictions: Series of predictions on non-holdout data
+        metrics: Dictionary of fold-aggregated metrics
+        holdout_results: Dictionary containing holdout test results
+    """
+    predictions = pd.Series(index=X.index, dtype=float)
+    meta_label_prob = pd.Series(index=X.index, dtype=float)
+    fold_pnls: list[float] = []
+    
+    if use_purged_cv:
+        splits, holdout_idx = purged_walk_forward_split(X, n_splits, horizon, holdout_fraction, holdout_size)
+    else:
+        effective_splits = max(2, min(n_splits, len(X) - 1))
+        splitter = TimeSeriesSplit(n_splits=effective_splits)
+        splits = list(splitter.split(X))
+        resolved_holdout_size = holdout_size if holdout_size is not None else max(1, int(len(X) * holdout_fraction))
+        resolved_holdout_size = min(max(1, int(resolved_holdout_size)), max(1, len(X) - 3))
+        holdout_idx = np.arange(len(X) - resolved_holdout_size, len(X))
+
+    for train_idx, test_idx in splits:
         model = model_builder()
         X_train = X.iloc[train_idx]
         y_train_raw = y.iloc[train_idx]
@@ -421,6 +604,8 @@ def walk_forward_backtest(
         fold_pred_norm = pd.Series(model.predict(X_test), index=X_test.index, dtype=float)
         fold_pred = fold_pred_norm * vol_scale.iloc[test_idx] if vol_scale is not None else fold_pred_norm
         predictions.iloc[test_idx] = fold_pred
+        if use_meta_label_filter:
+            meta_label_prob.iloc[test_idx] = fold_meta_label_probability(X_train, y_train_raw, model, X_test)
         fold_metrics = summarize_predictions(
             y.iloc[test_idx],
             fold_pred,
@@ -431,6 +616,12 @@ def walk_forward_backtest(
             event_threshold_mult,
             direction_prob_positive.iloc[test_idx] if direction_prob_positive is not None else None,
             direction_gate_prob,
+            meta_label_prob.iloc[test_idx] if use_meta_label_filter else None,
+            meta_label_gate_prob,
+            min_size_multiplier,
+            max_size_multiplier,
+            size_sigmoid_k,
+            size_conf_mid,
         )
         fold_pnls.append(float(fold_metrics["cum_pnl_proxy"]))
 
@@ -448,6 +639,12 @@ def walk_forward_backtest(
         event_threshold_mult,
         direction_prob_positive.loc[valid_index] if direction_prob_positive is not None else None,
         direction_gate_prob,
+        meta_label_prob.loc[valid_index] if use_meta_label_filter else None,
+        meta_label_gate_prob,
+        min_size_multiplier,
+        max_size_multiplier,
+        size_sigmoid_k,
+        size_conf_mid,
     )
 
     mean_fold_pnl = float(np.mean(fold_pnls)) if fold_pnls else 0.0
@@ -465,7 +662,118 @@ def walk_forward_backtest(
     metrics["fold_pnl_std"] = float(np.std(fold_pnls)) if fold_pnls else 0.0
     metrics["positive_fold_rate"] = float(np.mean(np.asarray(fold_pnls) > 0.0)) if fold_pnls else 0.0
 
-    return predictions, metrics
+    # Evaluate on locked holdout
+    X_holdout = X.iloc[holdout_idx]
+    y_holdout = y.iloc[holdout_idx]
+    context_holdout = context.iloc[holdout_idx]
+    direction_holdout = None
+    if direction_prob_positive is not None:
+        direction_holdout = direction_prob_positive.iloc[holdout_idx]
+    
+    # Train on all non-holdout data for holdout evaluation
+    train_end = len(X) - len(holdout_idx)
+    y_train_raw = y.iloc[:train_end] if len(holdout_idx) > 0 else y
+    vol_holdout = vol_scale.iloc[holdout_idx] if vol_scale is not None else None
+    y_train_fit = y_train_raw / vol_scale.iloc[:train_end] if vol_scale is not None else y_train_raw
+    
+    model_for_holdout = model_builder()
+    model_for_holdout.fit(X.iloc[:train_end], y_train_fit)
+    holdout_pred_norm = model_for_holdout.predict(X_holdout)
+    holdout_pred = holdout_pred_norm * vol_holdout if vol_scale is not None else holdout_pred_norm
+    holdout_pred = pd.Series(holdout_pred, index=X_holdout.index, dtype=float)
+    holdout_meta_prob = None
+    if use_meta_label_filter:
+        holdout_meta_prob = fold_meta_label_probability(
+            X.iloc[:train_end],
+            y.iloc[:train_end],
+            model_for_holdout,
+            X_holdout,
+        )
+    
+    holdout_metrics = summarize_predictions(
+        y_holdout,
+        holdout_pred,
+        context_holdout,
+        horizon,
+        uncertainty_gate,
+        break_threshold_mult,
+        event_threshold_mult,
+        direction_holdout,
+        direction_gate_prob,
+        holdout_meta_prob,
+        meta_label_gate_prob,
+        min_size_multiplier,
+        max_size_multiplier,
+        size_sigmoid_k,
+        size_conf_mid,
+    )
+    
+    holdout_results = {
+        "holdout_predictions": holdout_pred,
+        "holdout_metrics": holdout_metrics,
+        "holdout_size": len(holdout_idx),
+    }
+
+    return predictions, metrics, holdout_results
+
+
+def apply_prediction_stability_penalty(
+    predictions: pd.Series,
+    metrics: dict[str, float],
+    y: pd.Series,
+    context: pd.DataFrame,
+    config: RunConfig,
+    direction_prob_positive: pd.Series | None = None,
+) -> dict[str, float]:
+    valid_predictions = predictions.dropna()
+    if len(valid_predictions) < max(50, config.n_splits * 10):
+        return metrics
+
+    dummy_X = pd.DataFrame(index=valid_predictions.index)
+    effective_splits = max(2, min(config.n_splits, len(dummy_X) - 1))
+    splitter = TimeSeriesSplit(n_splits=effective_splits)
+    fold_pnls: list[float] = []
+
+    for _, test_idx in splitter.split(dummy_X):
+        fold_index = valid_predictions.index[test_idx]
+        fold_metrics = summarize_predictions(
+            y.loc[fold_index],
+            valid_predictions.loc[fold_index],
+            context.loc[fold_index],
+            horizon=config.horizon,
+            uncertainty_gate=config.uncertainty_gate,
+            break_threshold_mult=config.break_threshold_mult,
+            event_threshold_mult=config.event_threshold_mult,
+            direction_prob_positive=direction_prob_positive.loc[fold_index] if direction_prob_positive is not None else None,
+            direction_gate_prob=config.direction_gate_prob,
+            meta_label_prob=None,
+            meta_label_gate_prob=config.meta_label_gate_prob,
+            min_size_multiplier=config.min_size_multiplier,
+            max_size_multiplier=config.max_size_multiplier,
+            size_sigmoid_k=config.size_sigmoid_k,
+            size_conf_mid=config.size_conf_mid,
+        )
+        fold_pnls.append(float(fold_metrics["cum_pnl_proxy"]))
+
+    if not fold_pnls:
+        return metrics
+
+    mean_fold_pnl = float(np.mean(fold_pnls))
+    worst_fold_pnl = float(np.min(fold_pnls))
+    downside = abs(min(worst_fold_pnl, 0.0))
+    baseline = abs(mean_fold_pnl) + 1e-8
+    fold_drawdown_ratio = downside / baseline
+    stability_penalty = float(1.0 / (1.0 + config.stability_penalty_weight * fold_drawdown_ratio))
+
+    adjusted_metrics = dict(metrics)
+    adjusted_metrics["raw_selection_score"] = float(metrics.get("raw_selection_score", metrics["selection_score"]))
+    adjusted_metrics["selection_score"] = float(adjusted_metrics["raw_selection_score"] * stability_penalty)
+    adjusted_metrics["stability_penalty"] = stability_penalty
+    adjusted_metrics["worst_fold_pnl"] = worst_fold_pnl
+    adjusted_metrics["mean_fold_pnl"] = mean_fold_pnl
+    adjusted_metrics["fold_pnl_std"] = float(np.std(fold_pnls))
+    adjusted_metrics["positive_fold_rate"] = float(np.mean(np.asarray(fold_pnls) > 0.0))
+    return adjusted_metrics
 
 
 def summarize_feature_importance(model: Any, feature_names: list[str], top_n: int = 10) -> list[dict[str, Any]]:
@@ -492,6 +800,18 @@ def build_regime_router_candidate(
     if not base_names:
         return None
 
+    ranked_base_names = sorted(
+        base_names,
+        key=lambda name: (
+            evaluated[name]["metrics"]["selection_score"],
+            evaluated[name]["metrics"]["cum_pnl_proxy"],
+            -evaluated[name]["metrics"]["rmse"],
+        ),
+        reverse=True,
+    )
+    candidate_pool_size = max(3, min(len(ranked_base_names), config.top_k_ensemble + 2))
+    base_names = ranked_base_names[:candidate_pool_size]
+
     calm_mask = (context["break_flag"] == 0) & (context["macro_event_window"] == 0)
     stress_mask = ~calm_mask
 
@@ -509,12 +829,18 @@ def build_regime_router_candidate(
                 y.loc[idx],
                 pred.loc[idx],
                 context.loc[idx],
-                config.horizon,
-                config.uncertainty_gate,
-                config.break_threshold_mult,
-                config.event_threshold_mult,
-                direction_prob_positive.loc[idx] if direction_prob_positive is not None else None,
-                config.direction_gate_prob,
+                horizon=config.horizon,
+                uncertainty_gate=config.uncertainty_gate,
+                break_threshold_mult=config.break_threshold_mult,
+                event_threshold_mult=config.event_threshold_mult,
+                direction_prob_positive=direction_prob_positive.loc[idx] if direction_prob_positive is not None else None,
+                direction_gate_prob=config.direction_gate_prob,
+                meta_label_prob=None,
+                meta_label_gate_prob=config.meta_label_gate_prob,
+                min_size_multiplier=config.min_size_multiplier,
+                max_size_multiplier=config.max_size_multiplier,
+                size_sigmoid_k=config.size_sigmoid_k,
+                size_conf_mid=config.size_conf_mid,
             )
             if best_metrics is None or (
                 metrics["selection_score"],
@@ -556,13 +882,65 @@ def build_regime_router_candidate(
         y.loc[valid_idx],
         router_pred.loc[valid_idx],
         context.loc[valid_idx],
-        config.horizon,
-        config.uncertainty_gate,
-        config.break_threshold_mult,
-        config.event_threshold_mult,
-        direction_prob_positive.loc[valid_idx] if direction_prob_positive is not None else None,
-        config.direction_gate_prob,
+        horizon=config.horizon,
+        uncertainty_gate=config.uncertainty_gate,
+        break_threshold_mult=config.break_threshold_mult,
+        event_threshold_mult=config.event_threshold_mult,
+        direction_prob_positive=direction_prob_positive.loc[valid_idx] if direction_prob_positive is not None else None,
+        direction_gate_prob=config.direction_gate_prob,
+        meta_label_prob=None,
+        meta_label_gate_prob=config.meta_label_gate_prob,
+        min_size_multiplier=config.min_size_multiplier,
+        max_size_multiplier=config.max_size_multiplier,
+        size_sigmoid_k=config.size_sigmoid_k,
+        size_conf_mid=config.size_conf_mid,
     )
+    metrics = apply_prediction_stability_penalty(
+        router_pred.loc[valid_idx],
+        metrics,
+        y,
+        context,
+        config,
+        direction_prob_positive,
+    )
+
+    router_holdout_results: dict[str, Any] | None = None
+    calm_holdout = evaluated[calm_name].get("holdout_results", {}).get("holdout_predictions")
+    stress_holdout = evaluated[stress_name].get("holdout_results", {}).get("holdout_predictions")
+    if calm_holdout is not None and stress_holdout is not None:
+        holdout_index = calm_holdout.index.union(stress_holdout.index)
+        router_holdout_pred = pd.Series(index=holdout_index, dtype=float)
+        calm_holdout_idx = holdout_index[calm_mask.reindex(holdout_index).fillna(False)]
+        stress_holdout_idx = holdout_index[stress_mask.reindex(holdout_index).fillna(False)]
+        router_holdout_pred.loc[calm_holdout_idx] = calm_holdout.reindex(calm_holdout_idx)
+        router_holdout_pred.loc[stress_holdout_idx] = stress_holdout.reindex(stress_holdout_idx)
+
+        valid_holdout_idx = router_holdout_pred.dropna().index
+        if len(valid_holdout_idx) > 0:
+            router_holdout_metrics = summarize_predictions(
+                y.loc[valid_holdout_idx],
+                router_holdout_pred.loc[valid_holdout_idx],
+                context.loc[valid_holdout_idx],
+                horizon=config.horizon,
+                uncertainty_gate=config.uncertainty_gate,
+                break_threshold_mult=config.break_threshold_mult,
+                event_threshold_mult=config.event_threshold_mult,
+                direction_prob_positive=direction_prob_positive.loc[valid_holdout_idx]
+                if direction_prob_positive is not None
+                else None,
+                direction_gate_prob=config.direction_gate_prob,
+                meta_label_prob=None,
+                meta_label_gate_prob=config.meta_label_gate_prob,
+                min_size_multiplier=config.min_size_multiplier,
+                max_size_multiplier=config.max_size_multiplier,
+                size_sigmoid_k=config.size_sigmoid_k,
+                size_conf_mid=config.size_conf_mid,
+            )
+            router_holdout_results = {
+                "holdout_predictions": router_holdout_pred,
+                "holdout_metrics": router_holdout_metrics,
+                "holdout_size": len(valid_holdout_idx),
+            }
 
     latest_is_stress = bool(stress_mask.iloc[-1])
     final_prediction = float(
@@ -580,6 +958,110 @@ def build_regime_router_candidate(
             "stress_model": stress_name,
             "calm_condition": "break_flag==0 and macro_event_window==0",
         },
+        "holdout_results": router_holdout_results,
+    }
+
+
+def build_stacked_blend_candidate(
+    evaluated: dict[str, Any],
+    y: pd.Series,
+    context: pd.DataFrame,
+    config: RunConfig,
+    direction_prob_positive: pd.Series | None,
+) -> dict[str, Any] | None:
+    base_names = [name for name, payload in evaluated.items() if "members" not in payload]
+    if len(base_names) < 2:
+        return None
+
+    ranked_base_names = sorted(
+        base_names,
+        key=lambda name: (
+            evaluated[name]["metrics"]["selection_score"],
+            evaluated[name]["metrics"]["cum_pnl_proxy"],
+            -evaluated[name]["metrics"]["rmse"],
+        ),
+        reverse=True,
+    )
+    selected_names = ranked_base_names[: max(2, min(len(ranked_base_names), config.top_k_ensemble + 1))]
+
+    meta_columns: dict[str, pd.Series] = {}
+    holdout_index: pd.Index | None = None
+    prediction_column_names: list[str] = []
+    for name in selected_names:
+        combined_pred = evaluated[name]["predictions"].copy()
+        holdout_pred = evaluated[name].get("holdout_results", {}).get("holdout_predictions")
+        if holdout_pred is None:
+            return None
+        combined_pred.loc[holdout_pred.index] = holdout_pred
+        column_name = f"{name}_pred"
+        prediction_column_names.append(column_name)
+        meta_columns[column_name] = combined_pred
+        if holdout_index is None:
+            holdout_index = holdout_pred.index
+
+    if holdout_index is None or len(holdout_index) == 0:
+        return None
+
+    meta_X = pd.DataFrame(meta_columns, index=y.index)
+    meta_X["prediction_mean"] = meta_X[prediction_column_names].mean(axis=1)
+    meta_X["prediction_dispersion"] = meta_X[prediction_column_names].std(axis=1)
+    meta_X["break_flag"] = context["break_flag"].astype(float)
+    meta_X["macro_event_window"] = context["macro_event_window"].astype(float)
+    meta_X = meta_X.dropna()
+
+    meta_holdout_index = holdout_index.intersection(meta_X.index)
+    if len(meta_holdout_index) < 50 or len(meta_X) <= len(meta_holdout_index) + 200:
+        return None
+
+    meta_y = y.loc[meta_X.index]
+    meta_context = context.loc[meta_X.index]
+    meta_direction_prob = direction_prob_positive.loc[meta_X.index] if direction_prob_positive is not None else None
+
+    meta_builder = lambda: make_elastic_net(alpha=0.01, l1_ratio=0.15)
+    predictions, metrics, holdout_results = walk_forward_backtest(
+        meta_builder,
+        meta_X,
+        meta_y,
+        meta_context,
+        config.n_splits,
+        config.horizon,
+        config.uncertainty_gate,
+        config.break_threshold_mult,
+        config.event_threshold_mult,
+        config.stability_penalty_weight,
+        vol_scale=None,
+        direction_prob_positive=meta_direction_prob,
+        direction_gate_prob=config.direction_gate_prob,
+        use_meta_label_filter=config.use_meta_label_filter,
+        meta_label_gate_prob=config.meta_label_gate_prob,
+        min_size_multiplier=config.min_size_multiplier,
+        max_size_multiplier=config.max_size_multiplier,
+        size_sigmoid_k=config.size_sigmoid_k,
+        size_conf_mid=config.size_conf_mid,
+        use_purged_cv=config.use_purged_cv,
+        holdout_fraction=config.holdout_fraction,
+        holdout_size=len(meta_holdout_index),
+    )
+    metrics = apply_prediction_stability_penalty(
+        predictions,
+        metrics,
+        meta_y,
+        meta_context,
+        config,
+        meta_direction_prob,
+    )
+
+    fitted_model = meta_builder()
+    fitted_model.fit(meta_X, meta_y)
+    final_prediction = float(fitted_model.predict(meta_X.iloc[[-1]])[0])
+
+    return {
+        "predictions": predictions,
+        "metrics": metrics,
+        "final_prediction": final_prediction,
+        "feature_importance": summarize_feature_importance(fitted_model, list(meta_X.columns)),
+        "members": selected_names,
+        "holdout_results": holdout_results,
     }
 
 
@@ -607,6 +1089,16 @@ def build_quote_snapshot(
     half_width = config.quote_width * sigma * width_multiplier
     signal_to_noise = abs(final_prediction) / sigma if sigma > 0 else 0.0
 
+    adaptive_edge = metrics["edge_threshold"] * (
+        1.0
+        + config.break_threshold_mult * float(break_alarm)
+        + config.event_threshold_mult * float(event_window)
+    )
+    edge_excess = (abs(final_prediction) - adaptive_edge) / max(sigma, 1e-8)
+    confidence_curve = 1.0 / (1.0 + np.exp(-config.size_sigmoid_k * (edge_excess - config.size_conf_mid)))
+    dynamic_size = config.min_size_multiplier + (config.max_size_multiplier - config.min_size_multiplier) * confidence_curve
+    recommended_size = float(size_multiplier * dynamic_size)
+
     return {
         "spread_now": current_spread,
         "predicted_delta_spread": float(final_prediction),
@@ -618,8 +1110,13 @@ def build_quote_snapshot(
         "signal_to_noise": float(signal_to_noise),
         "macro_event_window": event_window,
         "break_alarm": break_alarm,
-        "recommended_size_multiplier": float(size_multiplier),
+        "recommended_size_multiplier": recommended_size,
     }
+
+def deployment_score(payload: dict[str, Any]) -> float:
+    cv_score = float(payload["metrics"]["selection_score"])
+    holdout_score = float(payload.get("holdout_results", {}).get("holdout_metrics", {}).get("selection_score", 0.0))
+    return 0.65 * cv_score + 0.35 * holdout_score
 
 
 def evaluate_models(config: RunConfig, dataset: pd.DataFrame) -> tuple[dict[str, Any], pd.DataFrame]:
@@ -638,7 +1135,7 @@ def evaluate_models(config: RunConfig, dataset: pd.DataFrame) -> tuple[dict[str,
 
     evaluated: dict[str, Any] = {}
     for model_name, builder in model_factories(config).items():
-        predictions, metrics = walk_forward_backtest(
+        predictions, metrics, holdout_results = walk_forward_backtest(
             builder,
             X,
             y,
@@ -652,6 +1149,14 @@ def evaluate_models(config: RunConfig, dataset: pd.DataFrame) -> tuple[dict[str,
             vol_scale=vol_scale,
             direction_prob_positive=direction_prob_positive,
             direction_gate_prob=config.direction_gate_prob,
+            use_meta_label_filter=config.use_meta_label_filter,
+            meta_label_gate_prob=config.meta_label_gate_prob,
+            min_size_multiplier=config.min_size_multiplier,
+            max_size_multiplier=config.max_size_multiplier,
+            size_sigmoid_k=config.size_sigmoid_k,
+            size_conf_mid=config.size_conf_mid,
+            use_purged_cv=config.use_purged_cv,
+            holdout_fraction=config.holdout_fraction,
         )
         fitted_model = builder()
         if vol_scale is not None:
@@ -665,6 +1170,7 @@ def evaluate_models(config: RunConfig, dataset: pd.DataFrame) -> tuple[dict[str,
             "metrics": metrics,
             "final_prediction": final_prediction,
             "feature_importance": summarize_feature_importance(fitted_model, list(X.columns)),
+            "holdout_results": holdout_results,
         }
         prediction_table[f"{model_name}_pred"] = predictions
 
@@ -680,17 +1186,33 @@ def evaluate_models(config: RunConfig, dataset: pd.DataFrame) -> tuple[dict[str,
             evaluated["regime_router"] = router_payload
             prediction_table["regime_router_pred"] = router_payload["predictions"]
 
+    stacked_payload = build_stacked_blend_candidate(
+        evaluated,
+        y,
+        context,
+        config,
+        direction_prob_positive,
+    )
+    if stacked_payload is not None:
+        evaluated["stacked_blend"] = stacked_payload
+        prediction_table["stacked_blend_pred"] = stacked_payload["predictions"]
+
     ranked_names = sorted(
         evaluated,
         key=lambda name: (
+            deployment_score(evaluated[name]),
             evaluated[name]["metrics"]["selection_score"],
+            evaluated[name].get("holdout_results", {}).get("holdout_metrics", {}).get("selection_score", 0.0),
             evaluated[name]["metrics"]["cum_pnl_proxy"],
             -evaluated[name]["metrics"]["rmse"],
         ),
         reverse=True,
     )
 
-    ensemble_members = ranked_names[: max(1, config.top_k_ensemble)]
+    ensemble_candidate_names = [name for name in ranked_names if "members" not in evaluated[name]]
+    if not ensemble_candidate_names:
+        ensemble_candidate_names = ranked_names
+    ensemble_members = ensemble_candidate_names[: max(1, config.top_k_ensemble)]
     ensemble_prediction_frame = pd.concat(
         [evaluated[name]["predictions"].rename(name) for name in ensemble_members],
         axis=1,
@@ -710,16 +1232,72 @@ def evaluate_models(config: RunConfig, dataset: pd.DataFrame) -> tuple[dict[str,
         y.loc[ensemble_valid_index],
         ensemble_predictions.loc[ensemble_valid_index],
         context.loc[ensemble_valid_index],
-        config.horizon,
-        config.uncertainty_gate,
-        config.break_threshold_mult,
-        config.event_threshold_mult,
-        direction_prob_positive.loc[ensemble_valid_index] if direction_prob_positive is not None else None,
-        config.direction_gate_prob,
+        horizon=config.horizon,
+        uncertainty_gate=config.uncertainty_gate,
+        break_threshold_mult=config.break_threshold_mult,
+        event_threshold_mult=config.event_threshold_mult,
+        direction_prob_positive=direction_prob_positive.loc[ensemble_valid_index]
+        if direction_prob_positive is not None
+        else None,
+        direction_gate_prob=config.direction_gate_prob,
+        meta_label_prob=None,
+        meta_label_gate_prob=config.meta_label_gate_prob,
+        min_size_multiplier=config.min_size_multiplier,
+        max_size_multiplier=config.max_size_multiplier,
+        size_sigmoid_k=config.size_sigmoid_k,
+        size_conf_mid=config.size_conf_mid,
+    )
+    ensemble_metrics = apply_prediction_stability_penalty(
+        ensemble_predictions.loc[ensemble_valid_index],
+        ensemble_metrics,
+        y,
+        context,
+        config,
+        direction_prob_positive,
     )
     ensemble_final_prediction = float(
         np.dot(member_weights, np.asarray([evaluated[name]["final_prediction"] for name in ensemble_members], dtype=float))
     )
+
+    ensemble_holdout_results: dict[str, Any] | None = None
+    holdout_frames: list[pd.Series] = []
+    for name in ensemble_members:
+        holdout_pred = evaluated[name].get("holdout_results", {}).get("holdout_predictions")
+        if holdout_pred is None:
+            holdout_frames = []
+            break
+        holdout_frames.append(holdout_pred.rename(name))
+
+    if holdout_frames:
+        ensemble_holdout_frame = pd.concat(holdout_frames, axis=1)
+        weighted_holdout_frame = ensemble_holdout_frame.mul(member_weights, axis=1)
+        ensemble_holdout_predictions = weighted_holdout_frame.sum(axis=1)
+        ensemble_holdout_valid_index = ensemble_holdout_predictions.dropna().index
+        if len(ensemble_holdout_valid_index) > 0:
+            ensemble_holdout_metrics = summarize_predictions(
+                y.loc[ensemble_holdout_valid_index],
+                ensemble_holdout_predictions.loc[ensemble_holdout_valid_index],
+                context.loc[ensemble_holdout_valid_index],
+                horizon=config.horizon,
+                uncertainty_gate=config.uncertainty_gate,
+                break_threshold_mult=config.break_threshold_mult,
+                event_threshold_mult=config.event_threshold_mult,
+                direction_prob_positive=direction_prob_positive.loc[ensemble_holdout_valid_index]
+                if direction_prob_positive is not None
+                else None,
+                direction_gate_prob=config.direction_gate_prob,
+                meta_label_prob=None,
+                meta_label_gate_prob=config.meta_label_gate_prob,
+                min_size_multiplier=config.min_size_multiplier,
+                max_size_multiplier=config.max_size_multiplier,
+                size_sigmoid_k=config.size_sigmoid_k,
+                size_conf_mid=config.size_conf_mid,
+            )
+            ensemble_holdout_results = {
+                "holdout_predictions": ensemble_holdout_predictions,
+                "holdout_metrics": ensemble_holdout_metrics,
+                "holdout_size": len(ensemble_holdout_valid_index),
+            }
 
     evaluated["ensemble_top"] = {
         "predictions": ensemble_predictions,
@@ -730,13 +1308,16 @@ def evaluate_models(config: RunConfig, dataset: pd.DataFrame) -> tuple[dict[str,
             name: float(weight) for name, weight in zip(ensemble_members, member_weights, strict=False)
         },
         "feature_importance": [],
+        "holdout_results": ensemble_holdout_results,
     }
     prediction_table["ensemble_top_pred"] = ensemble_predictions
 
     champion_name = max(
         evaluated,
         key=lambda name: (
+            deployment_score(evaluated[name]),
             evaluated[name]["metrics"]["selection_score"],
+            evaluated[name].get("holdout_results", {}).get("holdout_metrics", {}).get("selection_score", 0.0),
             evaluated[name]["metrics"]["cum_pnl_proxy"],
             -evaluated[name]["metrics"]["rmse"],
         ),
@@ -745,18 +1326,138 @@ def evaluate_models(config: RunConfig, dataset: pd.DataFrame) -> tuple[dict[str,
     return {"evaluated": evaluated, "champion_name": champion_name}, prediction_table
 
 
+def tune_objective_hyperparameters(config: RunConfig, dataset: pd.DataFrame) -> tuple[RunConfig, dict[str, Any]]:
+    """Tune thresholds toward selection score / Sharpe with trade-rate guardrails."""
+    uncertainty_grid = [0.20, 0.25, 0.30]
+    break_grid = [0.20, 0.25, 0.35]
+    event_grid = [0.05, 0.10, 0.15]
+    stability_grid = [0.40, 0.60, 0.80]
+    meta_gate_grid = [0.54, 0.56, 0.60]
+    sign_penalty_grid = [2.0, 2.5, 3.0, 3.5]
+    top_k_grid = [3, 4, 5]
+    use_router_grid = [True, False]
+    all_candidates = list(
+        product(
+            uncertainty_grid,
+            break_grid,
+            event_grid,
+            stability_grid,
+            meta_gate_grid,
+            sign_penalty_grid,
+            top_k_grid,
+            use_router_grid,
+        )
+    )
+
+    trial_count = max(1, min(config.tuning_trials, len(all_candidates)))
+    current_candidate = (
+        float(config.uncertainty_gate),
+        float(config.break_threshold_mult),
+        float(config.event_threshold_mult),
+        float(config.stability_penalty_weight),
+        float(config.meta_label_gate_prob),
+        float(config.sign_error_penalty),
+        int(config.top_k_ensemble),
+        bool(config.use_regime_router),
+    )
+    remaining_candidates = [candidate for candidate in all_candidates if candidate != current_candidate]
+    rng = random.Random(7)
+    sampled = [current_candidate]
+    if trial_count > 1 and remaining_candidates:
+        sampled.extend(rng.sample(remaining_candidates, k=min(trial_count - 1, len(remaining_candidates))))
+
+    best_cfg = config
+    best_score = -np.inf
+    best_details: dict[str, Any] = {
+        "trials": [],
+        "best_trial": None,
+    }
+
+    for (
+        uncertainty_gate,
+        break_mult,
+        event_mult,
+        stability_weight,
+        meta_gate,
+        sign_penalty,
+        top_k,
+        use_router,
+    ) in sampled:
+        candidate_cfg = clone_config(
+            config,
+            uncertainty_gate=float(uncertainty_gate),
+            break_threshold_mult=float(break_mult),
+            event_threshold_mult=float(event_mult),
+            stability_penalty_weight=float(stability_weight),
+            meta_label_gate_prob=float(meta_gate),
+            sign_error_penalty=float(sign_penalty),
+            top_k_ensemble=int(top_k),
+            use_regime_router=bool(use_router),
+            run_objective_tuning=False,
+        )
+        evaluation, _ = evaluate_models(candidate_cfg, dataset)
+        champion = evaluation["champion_name"]
+        metrics = evaluation["evaluated"][champion]["metrics"]
+        trade_rate = float(metrics["trade_rate"])
+        holdout_metrics = evaluation["evaluated"][champion].get("holdout_results", {}).get("holdout_metrics", {})
+        holdout_score = float(holdout_metrics.get("selection_score", 0.0))
+
+        # Score emphasizes selection quality, holdout robustness, and Sharpe, while penalizing tiny trade rates.
+        objective_score = (
+            float(metrics["selection_score"])
+            + 0.45 * float(metrics["sharpe_proxy"])
+            + 0.35 * holdout_score
+            - 0.80 * max(0.0, 0.18 - trade_rate)
+        )
+
+        trial_record = {
+            "uncertainty_gate": float(uncertainty_gate),
+            "break_threshold_mult": float(break_mult),
+            "event_threshold_mult": float(event_mult),
+            "stability_penalty_weight": float(stability_weight),
+            "meta_label_gate_prob": float(meta_gate),
+            "sign_error_penalty": float(sign_penalty),
+            "top_k_ensemble": int(top_k),
+            "use_regime_router": bool(use_router),
+            "champion": champion,
+            "selection_score": float(metrics["selection_score"]),
+            "sharpe_proxy": float(metrics["sharpe_proxy"]),
+            "trade_rate": trade_rate,
+            "holdout_selection_score": holdout_score,
+            "objective_score": float(objective_score),
+        }
+        best_details["trials"].append(trial_record)
+
+        if objective_score > best_score:
+            best_score = objective_score
+            best_cfg = candidate_cfg
+            best_details["best_trial"] = trial_record
+
+    return best_cfg, best_details
+
+
 def run_pipeline(config: RunConfig) -> dict[str, Any]:
     dataset = build_feature_frame(config)
-    evaluation, prediction_table = evaluate_models(config, dataset)
+    effective_config = config
+    tuning_report: dict[str, Any] | None = None
+    if config.run_objective_tuning:
+        effective_config, tuning_report = tune_objective_hyperparameters(config, dataset)
+    evaluation, prediction_table = evaluate_models(effective_config, dataset)
     latest_row = dataset.iloc[-1]
 
     model_results: dict[str, Any] = {}
     for model_name, payload in evaluation["evaluated"].items():
+        holdout_payload = payload.get("holdout_results", {})
+        holdout_metrics = holdout_payload.get("holdout_metrics")
         model_results[model_name] = {
             "metrics": payload["metrics"],
+            "deployment_score": deployment_score(payload),
             "live": build_quote_snapshot(config, latest_row, payload["metrics"], payload["final_prediction"]),
             "feature_importance": payload["feature_importance"],
         }
+        if holdout_metrics is not None:
+            model_results[model_name]["holdout_metrics"] = holdout_metrics
+            model_results[model_name]["holdout_size"] = int(holdout_payload.get("holdout_size", 0))
         if "members" in payload:
             model_results[model_name]["members"] = payload["members"]
         if "member_weights" in payload:
@@ -765,15 +1466,21 @@ def run_pipeline(config: RunConfig) -> dict[str, Any]:
     leaderboard = [
         {
             "model": model_name,
+            "deployment_score": float(deployment_score(payload)),
             "selection_score": float(payload["metrics"]["selection_score"]),
             "cum_pnl_proxy": float(payload["metrics"]["cum_pnl_proxy"]),
             "rmse": float(payload["metrics"]["rmse"]),
             "traded_hit_rate": float(payload["metrics"]["traded_hit_rate"]),
+            "holdout_selection_score": float(
+                payload.get("holdout_results", {}).get("holdout_metrics", {}).get("selection_score", 0.0)
+            ),
         }
         for model_name, payload in sorted(
             evaluation["evaluated"].items(),
             key=lambda item: (
+                deployment_score(item[1]),
                 item[1]["metrics"]["selection_score"],
+                item[1].get("holdout_results", {}).get("holdout_metrics", {}).get("selection_score", 0.0),
                 item[1]["metrics"]["cum_pnl_proxy"],
                 -item[1]["metrics"]["rmse"],
             ),
@@ -783,8 +1490,8 @@ def run_pipeline(config: RunConfig) -> dict[str, Any]:
 
     output = {
         "config": {
-            **asdict(config),
-            "output_dir": str(config.output_dir),
+            **asdict(effective_config),
+            "output_dir": str(effective_config.output_dir),
         },
         "dataset": {
             "rows": int(len(dataset)),
@@ -795,7 +1502,9 @@ def run_pipeline(config: RunConfig) -> dict[str, Any]:
         "leaderboard": leaderboard,
         "models": model_results,
     }
-    write_outputs(config.output_dir, output, prediction_table)
+    if tuning_report is not None:
+        output["tuning_report"] = tuning_report
+    write_outputs(effective_config.output_dir, output, prediction_table)
     return output
 
 
@@ -865,6 +1574,69 @@ def parse_args() -> RunConfig:
         default=2.5,
         help="XGBoost sign-error loss multiplier (>1 penalises wrong-direction predictions).",
     )
+    parser.add_argument(
+        "--min-size-multiplier",
+        type=float,
+        default=1.0,
+        help="Minimum dynamic size multiplier when a trade is taken.",
+    )
+    parser.add_argument(
+        "--max-size-multiplier",
+        type=float,
+        default=1.0,
+        help="Maximum dynamic size multiplier when confidence is high.",
+    )
+    parser.add_argument(
+        "--size-sigmoid-k",
+        type=float,
+        default=3.0,
+        help="Steepness of confidence-to-size sigmoid.",
+    )
+    parser.add_argument(
+        "--size-conf-mid",
+        type=float,
+        default=0.60,
+        help="Midpoint of edge-excess confidence for size scaling.",
+    )
+    parser.add_argument(
+        "--use-purged-cv",
+        action="store_true",
+        default=True,
+        help="Enable purged walk-forward CV to eliminate lookahead bias (default: enabled).",
+    )
+    parser.add_argument(
+        "--no-purged-cv",
+        action="store_true",
+        help="Disable purged walk-forward CV and use standard time-series splits.",
+    )
+    parser.add_argument(
+        "--holdout-fraction",
+        type=float,
+        default=0.15,
+        help="Fraction of data to reserve as locked holdout test block.",
+    )
+    parser.add_argument(
+        "--use-meta-label-filter",
+        action="store_true",
+        help="Enable meta-label trade filter for quality selection (experimental).",
+    )
+    parser.add_argument(
+        "--meta-label-gate-prob",
+        type=float,
+        default=0.56,
+        help="Minimum meta-label quality probability required for trade entry.",
+    )
+    parser.add_argument(
+        "--run-objective-tuning",
+        action="store_true",
+        help="Run constrained objective-aligned tuning before final evaluation.",
+    )
+    parser.add_argument(
+        "--tuning-trials",
+        type=int,
+        default=24,
+        help="Number of tuning trials to run when objective tuning is enabled.",
+    )
     args = parser.parse_args()
     return RunConfig(
         horizon=args.horizon,
@@ -883,6 +1655,16 @@ def parse_args() -> RunConfig:
         use_direction_filter=args.use_direction_filter,
         direction_gate_prob=args.direction_gate_prob,
         use_regime_router=not args.no_regime_router,
+        min_size_multiplier=args.min_size_multiplier,
+        max_size_multiplier=args.max_size_multiplier,
+        size_sigmoid_k=args.size_sigmoid_k,
+        size_conf_mid=args.size_conf_mid,
+        use_purged_cv=not args.no_purged_cv,
+        holdout_fraction=args.holdout_fraction,
+        use_meta_label_filter=args.use_meta_label_filter,
+        meta_label_gate_prob=args.meta_label_gate_prob,
+        run_objective_tuning=args.run_objective_tuning,
+        tuning_trials=args.tuning_trials,
     )
 
 
