@@ -836,64 +836,104 @@ def build_regime_router_candidate(
     calm_mask = (context["break_flag"] == 0) & (context["macro_event_window"] == 0)
     stress_mask = ~calm_mask
 
-    def best_for_mask(mask: pd.Series) -> tuple[str, dict[str, float]] | None:
-        best_name: str | None = None
-        best_metrics: dict[str, float] | None = None
-        for name in base_names:
-            pred = evaluated[name]["predictions"].dropna()
-            if pred.empty:
-                continue
-            idx = pred.index[mask.reindex(pred.index).fillna(False)]
-            if len(idx) < 200:
-                continue
-            metrics = summarize_predictions(
-                y.loc[idx],
-                pred.loc[idx],
-                context.loc[idx],
-                horizon=config.horizon,
-                uncertainty_gate=config.uncertainty_gate,
-                break_threshold_mult=config.break_threshold_mult,
-                event_threshold_mult=config.event_threshold_mult,
-                direction_prob_positive=direction_prob_positive.loc[idx] if direction_prob_positive is not None else None,
-                direction_gate_prob=config.direction_gate_prob,
-                meta_label_prob=None,
-                meta_label_gate_prob=config.meta_label_gate_prob,
-                min_size_multiplier=config.min_size_multiplier,
-                max_size_multiplier=config.max_size_multiplier,
-                size_sigmoid_k=config.size_sigmoid_k,
-                size_conf_mid=config.size_conf_mid,
-            )
-            if best_metrics is None or (
-                metrics["selection_score"],
-                metrics["cum_pnl_proxy"],
-                -metrics["rmse"],
-            ) > (
-                best_metrics["selection_score"],
-                best_metrics["cum_pnl_proxy"],
-                -best_metrics["rmse"],
-            ):
-                best_name = name
-                best_metrics = metrics
+    # -----------------------------------------------------------------------
+    # Walk-forward regime routing: every ROUTING_WINDOW periods, re-select
+    # the best calm/stress models based on performance in the immediately
+    # preceding window.  This avoids the "full-history winner" look-ahead
+    # that made the router choose high-CV-Sharpe / low-generalization models.
+    # For holdout, the model selected in the last CV block is applied as-is —
+    # exactly how live deployment would work.
+    # -----------------------------------------------------------------------
+    _ROUTING_WINDOW = 60   # re-evaluate every ~60 trading periods
+    _MIN_EVAL = 30         # min observations needed to score a model
 
-        if best_name is None or best_metrics is None:
+    # Collect sorted CV prediction index shared across all candidates
+    _all_timestamps: list = sorted(
+        set().union(*[
+            evaluated[n]["predictions"].dropna().index.tolist()
+            for n in base_names
+            if not evaluated[n]["predictions"].dropna().empty
+        ])
+    )
+    if len(_all_timestamps) < _ROUTING_WINDOW * 2:
+        return None  # Not enough data for walk-forward routing
+
+    def _score_for_window(
+        name: str, ts_idx: list, mask: pd.Series
+    ) -> float | None:
+        """Return selection_score for `name` on timestamps `ts_idx` filtered by `mask`."""
+        pred = evaluated[name]["predictions"].dropna()
+        row_idx = pred.index.intersection(
+            pd.Index(ts_idx)[mask.reindex(pd.Index(ts_idx)).fillna(False)]
+        )
+        if len(row_idx) < _MIN_EVAL:
             return None
-        return best_name, best_metrics
+        m = summarize_predictions(
+            y.loc[row_idx],
+            pred.loc[row_idx],
+            context.loc[row_idx],
+            horizon=config.horizon,
+            uncertainty_gate=config.uncertainty_gate,
+            break_threshold_mult=config.break_threshold_mult,
+            event_threshold_mult=config.event_threshold_mult,
+            direction_prob_positive=direction_prob_positive.loc[row_idx] if direction_prob_positive is not None else None,
+            direction_gate_prob=config.direction_gate_prob,
+            meta_label_prob=None,
+            meta_label_gate_prob=config.meta_label_gate_prob,
+            min_size_multiplier=config.min_size_multiplier,
+            max_size_multiplier=config.max_size_multiplier,
+            size_sigmoid_k=config.size_sigmoid_k,
+            size_conf_mid=config.size_conf_mid,
+        )
+        return float(m["selection_score"])
 
-    calm_choice = best_for_mask(calm_mask)
-    stress_choice = best_for_mask(stress_mask)
-    if calm_choice is None or stress_choice is None:
-        return None
+    def _best_name(ts_idx: list, mask: pd.Series) -> str:
+        """Return the base_name with the highest score on the given window+mask."""
+        best: str | None = None
+        best_score = float("-inf")
+        for name in base_names:
+            score = _score_for_window(name, ts_idx, mask)
+            if score is not None and score > best_score:
+                best_score = score
+                best = name
+        # Fall back to overall CV best if nothing scored
+        return best if best is not None else base_names[0]
 
-    calm_name, _ = calm_choice
-    stress_name, _ = stress_choice
-    calm_pred = evaluated[calm_name]["predictions"]
-    stress_pred = evaluated[stress_name]["predictions"]
-
+    # -----------------------------------------------------------------------
+    # Build router predictions block by block
+    # -----------------------------------------------------------------------
+    n = len(_all_timestamps)
     router_pred = pd.Series(index=y.index, dtype=float)
-    calm_idx = router_pred.index[calm_mask.reindex(router_pred.index).fillna(False)]
-    stress_idx = router_pred.index[stress_mask.reindex(router_pred.index).fillna(False)]
-    router_pred.loc[calm_idx] = calm_pred.reindex(calm_idx)
-    router_pred.loc[stress_idx] = stress_pred.reindex(stress_idx)
+
+    # Default model for the first block (no history): overall CV ranking #1
+    _default_calm = _best_name(_all_timestamps[:_ROUTING_WINDOW * 2], calm_mask)
+    _default_stress = _best_name(_all_timestamps[:_ROUTING_WINDOW * 2], stress_mask)
+    calm_name = _default_calm
+    stress_name = _default_stress
+    last_calm_name = calm_name
+    last_stress_name = stress_name
+
+    for block_start in range(0, n, _ROUTING_WINDOW):
+        block_ts = _all_timestamps[block_start : block_start + _ROUTING_WINDOW]
+        block_idx = pd.Index(block_ts)
+
+        if block_start > 0:
+            # Select based on the immediately preceding window
+            eval_ts = _all_timestamps[block_start - _ROUTING_WINDOW : block_start]
+            calm_name = _best_name(eval_ts, calm_mask)
+            stress_name = _best_name(eval_ts, stress_mask)
+            last_calm_name = calm_name
+            last_stress_name = stress_name
+
+        calm_block = block_idx[calm_mask.reindex(block_idx).fillna(False)]
+        stress_block = block_idx[stress_mask.reindex(block_idx).fillna(False)]
+
+        if len(calm_block):
+            calm_src = evaluated[calm_name]["predictions"].reindex(calm_block)
+            router_pred.loc[calm_block] = calm_src
+        if len(stress_block):
+            stress_src = evaluated[stress_name]["predictions"].reindex(stress_block)
+            router_pred.loc[stress_block] = stress_src
 
     valid_idx = router_pred.dropna().index
     if len(valid_idx) < 400:
@@ -925,9 +965,12 @@ def build_regime_router_candidate(
         direction_prob_positive,
     )
 
+    # -----------------------------------------------------------------------
+    # Holdout: use the model selected by the last CV block
+    # -----------------------------------------------------------------------
     router_holdout_results: dict[str, Any] | None = None
-    calm_holdout = evaluated[calm_name].get("holdout_results", {}).get("holdout_predictions")
-    stress_holdout = evaluated[stress_name].get("holdout_results", {}).get("holdout_predictions")
+    calm_holdout = evaluated[last_calm_name].get("holdout_results", {}).get("holdout_predictions")
+    stress_holdout = evaluated[last_stress_name].get("holdout_results", {}).get("holdout_predictions")
     if calm_holdout is not None and stress_holdout is not None:
         holdout_index = calm_holdout.index.union(stress_holdout.index)
         router_holdout_pred = pd.Series(index=holdout_index, dtype=float)
@@ -966,7 +1009,8 @@ def build_regime_router_candidate(
 
     latest_is_stress = bool(stress_mask.iloc[-1])
     final_prediction = float(
-        evaluated[stress_name]["final_prediction"] if latest_is_stress else evaluated[calm_name]["final_prediction"]
+        evaluated[last_stress_name]["final_prediction"] if latest_is_stress
+        else evaluated[last_calm_name]["final_prediction"]
     )
 
     return {
@@ -974,11 +1018,12 @@ def build_regime_router_candidate(
         "metrics": metrics,
         "final_prediction": final_prediction,
         "feature_importance": [],
-        "members": [calm_name, stress_name],
+        "members": [last_calm_name, last_stress_name],
         "router_rules": {
-            "calm_model": calm_name,
-            "stress_model": stress_name,
+            "calm_model": last_calm_name,
+            "stress_model": last_stress_name,
             "calm_condition": "break_flag==0 and macro_event_window==0",
+            "routing_window": _ROUTING_WINDOW,
         },
         "holdout_results": router_holdout_results,
     }
