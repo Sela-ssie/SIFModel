@@ -46,13 +46,13 @@ class RunConfig:
     output_dir: Path = Path("outputs")
     use_xgboost: bool = False
     use_lightgbm: bool = False
-    top_k_ensemble: int = 4
+    top_k_ensemble: int = 5
     uncertainty_gate: float = 0.25
-    break_threshold_mult: float = 0.25
+    break_threshold_mult: float = 0.35
     event_threshold_mult: float = 0.10
-    stability_penalty_weight: float = 0.60
+    stability_penalty_weight: float = 0.40
     normalize_label: bool = False
-    sign_error_penalty: float = 2.5
+    sign_error_penalty: float = 3.5
     use_direction_filter: bool = False
     direction_gate_prob: float = 0.54
     use_regime_router: bool = True
@@ -63,7 +63,7 @@ class RunConfig:
     use_purged_cv: bool = True
     holdout_fraction: float = 0.15
     use_meta_label_filter: bool = False
-    meta_label_gate_prob: float = 0.56
+    meta_label_gate_prob: float = 0.54
     run_objective_tuning: bool = False
     tuning_trials: int = 24
 
@@ -399,23 +399,34 @@ def summarize_predictions(
     max_size_multiplier: float = 1.25,
     size_sigmoid_k: float = 3.0,
     size_conf_mid: float = 0.60,
+    trade_rate_cap: float | None = 0.25,
+    reference_sigma: float | None = None,
 ) -> dict[str, float]:
     residual = y_true - y_pred
     residual_sigma = float(residual.std()) if len(residual) else 0.0
-    edge_threshold = max(residual_sigma * 0.30, float(y_true.abs().median() * 0.15))
+    min_edge = float(y_true.abs().median() * 0.15)
+
+    # Use reference_sigma (from CV calibration) when provided so holdout
+    # evaluation uses the same threshold scale as CV — avoids look-ahead bias
+    # where a shorter/quieter holdout window would produce a smaller sigma and
+    # therefore a lower filter bar, artificially inflating the holdout trade rate.
+    effective_sigma = reference_sigma if (reference_sigma is not None and reference_sigma > 0) else residual_sigma
+    _base_edge = max(effective_sigma * 0.30, min_edge)
+    local_sigma = pd.Series(max(effective_sigma, 1e-8), index=y_pred.index)
+    edge_threshold_series = pd.Series(_base_edge, index=y_pred.index)
 
     size_multiplier = pd.Series(1.0, index=context.index)
     size_multiplier = size_multiplier.where(context["macro_event_window"] == 0, 0.75)
     size_multiplier = size_multiplier.where(context["break_flag"] == 0, size_multiplier * 0.50)
 
-    adaptive_edge = edge_threshold * (
+    adaptive_edge = edge_threshold_series * (
         1.0
         + break_threshold_mult * context["break_flag"].astype(float)
         + event_threshold_mult * context["macro_event_window"].astype(float)
     )
 
     direction = np.sign(y_pred)
-    normalized_confidence = y_pred.abs() / max(residual_sigma, 1e-8)
+    normalized_confidence = y_pred.abs() / local_sigma
     trade_mask = (y_pred.abs() > adaptive_edge) & (normalized_confidence > uncertainty_gate)
     if direction_prob_positive is not None:
         direction_prob_positive = direction_prob_positive.reindex(y_pred.index)
@@ -426,7 +437,16 @@ def summarize_predictions(
     if meta_label_prob is not None:
         trade_mask = trade_mask & (meta_label_prob.reindex(y_pred.index).fillna(0.0) >= meta_label_gate_prob)
 
-    edge_excess = (y_pred.abs() - adaptive_edge) / max(residual_sigma, 1e-8)
+    edge_excess = (y_pred.abs() - adaptive_edge) / local_sigma
+
+    if trade_rate_cap is not None and 0.0 < trade_rate_cap < float(trade_mask.mean()):
+        eligible_index = edge_excess[trade_mask].sort_values(ascending=False).index
+        max_trades = max(1, int(np.floor(trade_rate_cap * len(trade_mask))))
+        selected_index = eligible_index[:max_trades]
+        capped_trade_mask = pd.Series(False, index=trade_mask.index)
+        capped_trade_mask.loc[selected_index] = True
+        trade_mask = capped_trade_mask
+
     confidence_curve = 1.0 / (1.0 + np.exp(-size_sigmoid_k * (edge_excess - size_conf_mid)))
     dynamic_size = min_size_multiplier + (max_size_multiplier - min_size_multiplier) * confidence_curve
     effective_size_multiplier = size_multiplier * dynamic_size
@@ -456,7 +476,7 @@ def summarize_predictions(
         "selection_score": selection_score,
         "raw_selection_score": selection_score,
         "residual_sigma": residual_sigma,
-        "edge_threshold": edge_threshold,
+        "edge_threshold": float(edge_threshold_series.iloc[-1]) if len(edge_threshold_series) else min_edge,
     }
 
 
@@ -706,6 +726,7 @@ def walk_forward_backtest(
         max_size_multiplier,
         size_sigmoid_k,
         size_conf_mid,
+        reference_sigma=metrics["residual_sigma"],
     )
     
     holdout_results = {
@@ -935,6 +956,7 @@ def build_regime_router_candidate(
                 max_size_multiplier=config.max_size_multiplier,
                 size_sigmoid_k=config.size_sigmoid_k,
                 size_conf_mid=config.size_conf_mid,
+                reference_sigma=metrics["residual_sigma"],
             )
             router_holdout_results = {
                 "holdout_predictions": router_holdout_pred,
@@ -1116,14 +1138,15 @@ def build_quote_snapshot(
 def deployment_score(payload: dict[str, Any]) -> float:
     cv_score = float(payload["metrics"]["selection_score"])
     holdout_score = float(payload.get("holdout_results", {}).get("holdout_metrics", {}).get("selection_score", 0.0))
-    return 0.65 * cv_score + 0.35 * holdout_score
+    holdout_penalty = 1.5 * max(0.0, -holdout_score)
+    return 0.65 * cv_score + 0.35 * holdout_score - holdout_penalty
 
 
 def evaluate_models(config: RunConfig, dataset: pd.DataFrame) -> tuple[dict[str, Any], pd.DataFrame]:
     X = dataset.drop(columns=["dS_H", "S_now"])
     y = dataset["dS_H"]
     vol_scale: pd.Series | None = dataset["spread_vol_20"].clip(lower=1e-8) if config.normalize_label else None
-    context = dataset[["macro_event_window", "break_flag", "S_now"]].copy()
+    context = dataset[["macro_event_window", "break_flag", "S_now", "spread_vol_20"]].copy()
     direction_prob_positive: pd.Series | None = None
     if config.use_direction_filter:
         direction_prob_positive, _ = walk_forward_direction_filter(X, y, config.n_splits)
@@ -1328,14 +1351,16 @@ def evaluate_models(config: RunConfig, dataset: pd.DataFrame) -> tuple[dict[str,
 
 def tune_objective_hyperparameters(config: RunConfig, dataset: pd.DataFrame) -> tuple[RunConfig, dict[str, Any]]:
     """Tune thresholds toward selection score / Sharpe with trade-rate guardrails."""
-    uncertainty_grid = [0.20, 0.25, 0.30]
-    break_grid = [0.20, 0.25, 0.35]
-    event_grid = [0.05, 0.10, 0.15]
+    uncertainty_grid = [0.25, 0.35, 0.50, 0.70]
+    break_grid = [0.35, 0.60, 0.90]
+    event_grid = [0.10, 0.30, 0.50]
     stability_grid = [0.40, 0.60, 0.80]
     meta_gate_grid = [0.54, 0.56, 0.60]
     sign_penalty_grid = [2.0, 2.5, 3.0, 3.5]
     top_k_grid = [3, 4, 5]
     use_router_grid = [True, False]
+    min_size_grid = [0.3, 0.5, 0.7]
+    max_size_grid = [1.3, 1.5, 1.8]
     all_candidates = list(
         product(
             uncertainty_grid,
@@ -1346,6 +1371,8 @@ def tune_objective_hyperparameters(config: RunConfig, dataset: pd.DataFrame) -> 
             sign_penalty_grid,
             top_k_grid,
             use_router_grid,
+            min_size_grid,
+            max_size_grid,
         )
     )
 
@@ -1359,6 +1386,8 @@ def tune_objective_hyperparameters(config: RunConfig, dataset: pd.DataFrame) -> 
         float(config.sign_error_penalty),
         int(config.top_k_ensemble),
         bool(config.use_regime_router),
+        float(config.min_size_multiplier),
+        float(config.max_size_multiplier),
     )
     remaining_candidates = [candidate for candidate in all_candidates if candidate != current_candidate]
     rng = random.Random(7)
@@ -1382,6 +1411,8 @@ def tune_objective_hyperparameters(config: RunConfig, dataset: pd.DataFrame) -> 
         sign_penalty,
         top_k,
         use_router,
+        min_size,
+        max_size,
     ) in sampled:
         candidate_cfg = clone_config(
             config,
@@ -1393,6 +1424,8 @@ def tune_objective_hyperparameters(config: RunConfig, dataset: pd.DataFrame) -> 
             sign_error_penalty=float(sign_penalty),
             top_k_ensemble=int(top_k),
             use_regime_router=bool(use_router),
+            min_size_multiplier=float(min_size),
+            max_size_multiplier=float(max_size),
             run_objective_tuning=False,
         )
         evaluation, _ = evaluate_models(candidate_cfg, dataset)
@@ -1401,13 +1434,26 @@ def tune_objective_hyperparameters(config: RunConfig, dataset: pd.DataFrame) -> 
         trade_rate = float(metrics["trade_rate"])
         holdout_metrics = evaluation["evaluated"][champion].get("holdout_results", {}).get("holdout_metrics", {})
         holdout_score = float(holdout_metrics.get("selection_score", 0.0))
+        holdout_trade_rate = float(holdout_metrics.get("trade_rate", 0.0))
 
-        # Score emphasizes selection quality, holdout robustness, and Sharpe, while penalizing tiny trade rates.
+        trade_floor_penalty = max(0.0, 0.25 - trade_rate)
+        trade_ceiling_penalty = max(0.0, trade_rate - 0.45)
+        holdout_trade_ceiling_penalty = max(0.0, holdout_trade_rate - 0.55)
+        trade_rate_ratio = (holdout_trade_rate + 1e-9) / (trade_rate + 1e-9)
+        ratio_mismatch = abs(float(np.log(max(trade_rate_ratio, 1e-9))))
+        ratio_tolerance = float(np.log(1.25))
+        trade_divergence_penalty = max(0.0, ratio_mismatch - ratio_tolerance)
+
+        # Score emphasizes selection quality and holdout robustness while enforcing trade-rate guardrails.
         objective_score = (
             float(metrics["selection_score"])
             + 0.45 * float(metrics["sharpe_proxy"])
             + 0.35 * holdout_score
-            - 0.80 * max(0.0, 0.18 - trade_rate)
+            - 1.25 * max(0.0, -holdout_score)
+            - 0.80 * trade_floor_penalty
+            - 2.00 * trade_ceiling_penalty
+            - 2.50 * holdout_trade_ceiling_penalty
+            - 0.80 * trade_divergence_penalty
         )
 
         trial_record = {
@@ -1419,10 +1465,18 @@ def tune_objective_hyperparameters(config: RunConfig, dataset: pd.DataFrame) -> 
             "sign_error_penalty": float(sign_penalty),
             "top_k_ensemble": int(top_k),
             "use_regime_router": bool(use_router),
+            "min_size_multiplier": float(min_size),
+            "max_size_multiplier": float(max_size),
             "champion": champion,
             "selection_score": float(metrics["selection_score"]),
             "sharpe_proxy": float(metrics["sharpe_proxy"]),
             "trade_rate": trade_rate,
+            "holdout_trade_rate": holdout_trade_rate,
+            "trade_rate_ratio": float(trade_rate_ratio),
+            "trade_floor_penalty": float(trade_floor_penalty),
+            "trade_ceiling_penalty": float(trade_ceiling_penalty),
+            "holdout_trade_ceiling_penalty": float(holdout_trade_ceiling_penalty),
+            "trade_divergence_penalty": float(trade_divergence_penalty),
             "holdout_selection_score": holdout_score,
             "objective_score": float(objective_score),
         }
@@ -1522,7 +1576,7 @@ def parse_args() -> RunConfig:
     parser.add_argument("--output-dir", type=Path, default=Path("outputs"), help="Directory for JSON and CSV outputs.")
     parser.add_argument("--use-xgboost", action="store_true", help="Evaluate the optional XGBoost models.")
     parser.add_argument("--use-lightgbm", action="store_true", help="Evaluate optional LightGBM challenger models.")
-    parser.add_argument("--top-k-ensemble", type=int, default=4, help="Number of top models to average in the ensemble.")
+    parser.add_argument("--top-k-ensemble", type=int, default=5, help="Number of top models to average in the ensemble.")
     parser.add_argument(
         "--uncertainty-gate",
         type=float,
@@ -1532,7 +1586,7 @@ def parse_args() -> RunConfig:
     parser.add_argument(
         "--break-threshold-mult",
         type=float,
-        default=0.25,
+        default=0.35,
         help="Additional threshold multiplier applied during break-like regimes.",
     )
     parser.add_argument(
@@ -1544,7 +1598,7 @@ def parse_args() -> RunConfig:
     parser.add_argument(
         "--stability-penalty-weight",
         type=float,
-        default=0.60,
+        default=0.40,
         help="Penalty weight for unstable fold PnL when ranking models.",
     )
     parser.add_argument(
@@ -1571,7 +1625,7 @@ def parse_args() -> RunConfig:
     parser.add_argument(
         "--sign-error-penalty",
         type=float,
-        default=2.5,
+        default=3.5,
         help="XGBoost sign-error loss multiplier (>1 penalises wrong-direction predictions).",
     )
     parser.add_argument(
@@ -1623,7 +1677,7 @@ def parse_args() -> RunConfig:
     parser.add_argument(
         "--meta-label-gate-prob",
         type=float,
-        default=0.56,
+        default=0.54,
         help="Minimum meta-label quality probability required for trade entry.",
     )
     parser.add_argument(
