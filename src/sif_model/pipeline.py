@@ -241,7 +241,7 @@ def build_feature_frame(config: RunConfig) -> pd.DataFrame:
     features["vix_z20"] = safe_zscore(prices["VIXCLS"], 20)
     features["vix_z60"] = safe_zscore(prices["VIXCLS"], 60)
 
-    features = features.join(build_event_flags(features.index))
+    features = features.join(build_event_flags(pd.DatetimeIndex(features.index)))
     features["break_flag"] = (
         (features["spread_vol_ratio_20_60"] > 1.35)
         | (features["corr_20"] < 0.55)
