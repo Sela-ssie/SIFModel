@@ -41,6 +41,7 @@ FRED_SERIES = ("DGS10", "DGS2", "VIXCLS")
 @dataclass(slots=True)
 class RunConfig:
     horizon: int = 15
+    settlement_date: str | None = None  # e.g. "2026-04-16" — auto-computes horizon from latest price date
     n_splits: int = 6
     quote_width: float = 0.35
     output_dir: Path = Path("outputs")
@@ -180,9 +181,22 @@ def load_market_data() -> pd.DataFrame:
     return prices.ffill()
 
 
-def build_feature_frame(config: RunConfig) -> pd.DataFrame:
+def build_feature_frame(config: RunConfig) -> tuple[pd.DataFrame, pd.Series, int]:
     prices = load_market_data()
     prices["S"] = prices["SOXX.US"] / 4.0 - prices["IGV.US"]
+
+    # Compute effective horizon — either fixed or counted down to a settlement date
+    if config.settlement_date is not None:
+        settlement = pd.Timestamp(config.settlement_date)
+        latest_price_date = prices.index[-1]
+        effective_horizon = int(np.busday_count(str(latest_price_date.date()), str(settlement.date())))
+        if effective_horizon < 1:
+            raise ValueError(
+                f"Settlement date {config.settlement_date} is on or before the latest price date "
+                f"{latest_price_date.date()}. Cannot compute a positive horizon."
+            )
+    else:
+        effective_horizon = config.horizon
 
     returns = pd.DataFrame(index=prices.index)
     for column in ("SOXX.US", "IGV.US", "QQQ.US", "SPY.US"):
@@ -248,10 +262,15 @@ def build_feature_frame(config: RunConfig) -> pd.DataFrame:
         | (features["vix_z20"] > 1.25)
     ).astype(int)
 
-    label = (prices["S"].shift(-config.horizon) - prices["S"]).rename("dS_H")
+    label = (prices["S"].shift(-effective_horizon) - prices["S"]).rename("dS_H")
     dataset = features.join(label).dropna().copy()
     dataset["S_now"] = prices.loc[dataset.index, "S"]
-    return dataset
+
+    # Live row: latest available date (NOT subject to label dropna)
+    live_features = features.copy()
+    live_features["S_now"] = prices["S"]
+    live_row = live_features.dropna(subset=[c for c in live_features.columns if c != "dS_H"]).iloc[-1].copy()
+    return dataset, live_row, effective_horizon
 
 
 def make_elastic_net(alpha: float, l1_ratio: float) -> Pipeline:
@@ -1536,13 +1555,16 @@ def tune_objective_hyperparameters(config: RunConfig, dataset: pd.DataFrame) -> 
 
 
 def run_pipeline(config: RunConfig) -> dict[str, Any]:
-    dataset = build_feature_frame(config)
+    dataset, live_row, effective_horizon = build_feature_frame(config)
+    # If settlement_date drove the horizon, update config so downstream code sees the correct value
+    if config.settlement_date is not None:
+        config = clone_config(config, horizon=effective_horizon)
     effective_config = config
     tuning_report: dict[str, Any] | None = None
     if config.run_objective_tuning:
         effective_config, tuning_report = tune_objective_hyperparameters(config, dataset)
     evaluation, prediction_table = evaluate_models(effective_config, dataset)
-    latest_row = dataset.iloc[-1]
+    latest_row = live_row
 
     model_results: dict[str, Any] = {}
     for model_name, payload in evaluation["evaluated"].items():
@@ -1596,6 +1618,7 @@ def run_pipeline(config: RunConfig) -> dict[str, Any]:
             "rows": int(len(dataset)),
             "start": str(dataset.index.min().date()),
             "end": str(dataset.index.max().date()),
+            "horizon": effective_horizon,
         },
         "champion_model": evaluation["champion_name"],
         "leaderboard": leaderboard,
@@ -1616,6 +1639,13 @@ def write_outputs(output_dir: Path, output: dict[str, Any], predictions: pd.Data
 def parse_args() -> RunConfig:
     parser = argparse.ArgumentParser(description="Run the spread model pipeline for SOXX/4 - IGV.")
     parser.add_argument("--horizon", type=int, default=15, help="Forecast horizon in trading days.")
+    parser.add_argument(
+        "--settlement-date",
+        type=str,
+        default=None,
+        help="Settlement date as YYYY-MM-DD (e.g. 2026-04-16). Overrides --horizon by counting "
+             "business days from the latest available price close to this date.",
+    )
     parser.add_argument("--n-splits", type=int, default=6, help="Number of walk-forward splits.")
     parser.add_argument("--quote-width", type=float, default=0.35, help="Base quote-width factor applied to residual sigma.")
     parser.add_argument("--output-dir", type=Path, default=Path("outputs"), help="Directory for JSON and CSV outputs.")
@@ -1739,6 +1769,7 @@ def parse_args() -> RunConfig:
     args = parser.parse_args()
     return RunConfig(
         horizon=args.horizon,
+        settlement_date=args.settlement_date,
         n_splits=args.n_splits,
         quote_width=args.quote_width,
         output_dir=args.output_dir,
